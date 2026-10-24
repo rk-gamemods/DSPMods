@@ -13,6 +13,12 @@ passes the offline acceptance checks below, and is expected to operate with the
 assessed current-game assemblies on Direct3D 11. No game files have been changed
 or game process run; in-game appearance and performance remain unverified.
 
+The subsequent [installed-stack review](OPTIMIZATION_STACK.md) identifies a
+paint-transpiler ordering hazard with DSPOptimizations 1.1.19. The acceptance
+record below covers the candidate's isolated offline contracts, not compatibility
+with that combined stack. Resolve composition before treating the candidate as
+validated for those installed mods.
+
 ## Scope and evidence
 
 The user requested a complete investigation, including author statements and
@@ -278,6 +284,12 @@ visual parity, save behavior, multiplayer compatibility or a measured speedup.
 Those limits apply even when all build and contract checks pass.
 
 ## Next optimization priorities
+
+The [stack review](OPTIMIZATION_STACK.md#combined-patch-risks-to-resolve-first)
+adds combined paint/draw patch validation ahead of this proposed CPU work.
+Weaver already owns simulation scheduling and Dyson power optimizations;
+DSPOptimizations owns vanilla node/frame buffer synchronization. Keep the next
+SphereOpt changes within its own shell rendering and buffer state.
 
 On 2026-10-24, the user prioritized CPU overhead reduction and requested that
 visibility culling be logged for a later, more ambitious project. These are

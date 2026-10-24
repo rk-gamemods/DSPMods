@@ -14,6 +14,31 @@
     "candidate_patch": "patches/SphereOpt-current-game.patch",
     "candidate_bundle_sha256": "ea9719ae0307a1bbf07fae22f4c6dff485091a6ab4610065a2ba1883564ba75b"
   },
+  "optimization_stack_review": {
+    "date": "2026-10-24",
+    "report": "docs/OPTIMIZATION_STACK.md",
+    "Weaver": {
+      "url": "https://github.com/TheAIBot/DSP_Weaver",
+      "installed_package_version": "2.5.0",
+      "installed_dll_sha256": "26c20109c224c762105eba0087271cafe8aa4aee9adf575dfb9587eadfd43113",
+      "reviewed_commit": "55fcd2cf7461a29abd4f911eaa1fff63ee2b33a3",
+      "release_commit": "891de047e65c27f89c6b4b9db4a2576eefa642ed",
+      "source_note": "Reviewed HEAD includes prospective 2.6.0 work; installed DLL matches the committed 2.5.0 artifact."
+    },
+    "DSPOptimizations": {
+      "url": "https://github.com/Selsion/DSPMods/tree/main/DSPOptimizations",
+      "installed_package_version": "1.1.19",
+      "installed_dll_sha256": "721ad22d207eea7ed8a33fe0a5d57682fa715517db5e858a529e4178967f33ba",
+      "reviewed_commit": "d46a01cb5db971fc7935e0fb13f172d367b96638"
+    },
+    "BuildToolOpt": {
+      "url": "https://github.com/starfi5h/DSP_Mod/tree/master/BuildToolOpt",
+      "installed_package_version": "1.1.8",
+      "installed_dll_sha256": "3240d870c51f9f7f0708ada65a721b515ee1d02df049b2d6bf8b8a1a5328efde",
+      "reviewed_commit": "fdb6e3573d41f78b3443d0c6021211d48585c956",
+      "reviewed_subtree": "8208c793e1a9ec0cbf11d3ff76c4d66a7fc09dc2"
+    }
+  },
   "assessment": {
     "date": "2026-10-23",
     "game_version": "0.10.35.29151",

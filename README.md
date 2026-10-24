@@ -11,6 +11,10 @@ shell programs. It retains vanilla node/frame rendering. Build and offline
 contracts do not establish in-game visuals or a performance gain. The
 [initial 0.9.2 assessment](docs/SPHEREOPT_ASSESSMENT.md) records the baseline.
 
+The [installed optimization-stack review](docs/OPTIMIZATION_STACK.md) covers
+Weaver, DSPOptimizations and BuildToolOpt, their overlap with SphereOpt, and
+the combined patch checks needed before further optimization.
+
 ## Prepare
 
 ```powershell
