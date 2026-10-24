@@ -39,9 +39,10 @@ def main() -> None:
     source = command("git", "rev-parse", "HEAD", cwd=CLONE)
     subprocess.run([sys.executable, str(ROOT / "tools/game_snapshot.py"), "verify"], cwd=ROOT, check=True)
     # The build project lives in the outer workspace. Its documentation commits
-    # must not become this independent mod's assembly informational revision.
-    subprocess.run(["dotnet", "build", "tools/SphereOpt.OfflineBuild", "-c", "Release", "--no-restore", "-v", "minimal",
-                    "-p:SourceRevisionId=" + source], cwd=ROOT, check=True)
+    # must not become this independent mod's assembly informational revision or
+    # its PDB Source Link mapping (whose content also changes the DLL identity).
+    subprocess.run(["dotnet", "build", "tools/SphereOpt.OfflineBuild", "-c", "Release", "--no-restore", "--no-incremental", "-v", "minimal",
+                    "-p:SourceRevisionId=" + source, "-p:EnableSourceLink=false"], cwd=ROOT, check=True)
     dll = ROOT / ".local/build/SphereOpt/SphereOpt.dll"
     subprocess.run([sys.executable, str(ROOT / "tools/game_snapshot.py"), "check-mod", str(dll)], cwd=ROOT, check=True)
     compatibility = json.loads((ROOT / ".local/compatibility.json").read_text(encoding="utf-8"))

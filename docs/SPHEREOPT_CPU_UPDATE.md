@@ -89,9 +89,13 @@ bytes. These are algorithmic counts, not measured driver or game performance.
 ## Packaging identity
 
 The package build pins its assembly informational revision to the independent
-mod commit. A documentation commit in the outer workspace must not change that
-revision or the resulting mod bytes. Source identity is checked before and after
-packaging; deterministic ZIP readback verifies the included payload.
+mod commit and disables the outer workspace's Source Link mapping. A documentation
+commit there must not change the revision or resulting mod bytes. The SDK's
+[Source Link generation](https://github.com/dotnet/sourcelink/blob/main/docs/README.md#enablesourcelink)
+otherwise includes that workspace's commit through the PDB. Source identity is
+checked before and after packaging. Packaging forces a fresh compilation because
+an incremental build can retain prior debug metadata. Deterministic ZIP
+readback verifies the included payload.
 
 ## Validation record
 
@@ -125,9 +129,9 @@ an older summary unchanged; callers must check the process exit status.
 
 The local package is `.local/packages/SphereOpt-0.9.3-0411bf590edc.zip`, 319,533
 bytes, SHA-256
-`efef6bea555c88d14a406202ec9afdbc5e01d7173394e0fee7ddd43c180a63db`.
+`7f16ebf235547a618e67cea2b12f0c7276a87b42c6b8c6f1023eaede97b9ef03`.
 Its DLL is 111,616 bytes, SHA-256
-`741fef0bd91d5a6750e32cc9b8c98ffb15f8df06daef0554db6050b36824218c`;
+`53e58a33cfec1a8f5cf09a86502709d47a46e8da9dec9b054a981bf9b14714ef`;
 assembly informational version is
 `0.9.3+0411bf590edc29e86a78caead151cf1269ef8b64`.
 
