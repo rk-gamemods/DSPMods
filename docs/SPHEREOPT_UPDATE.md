@@ -276,3 +276,57 @@ published patch against the pinned baseline using an isolated Git index.
 No offline check executes the game or establishes native Unity bundle loading,
 visual parity, save behavior, multiplayer compatibility or a measured speedup.
 Those limits apply even when all build and contract checks pass.
+
+## Next optimization priorities
+
+On 2026-10-24, the user prioritized CPU overhead reduction and requested that
+visibility culling be logged for a later, more ambitious project. These are
+follow-up proposals; the assessed mod and its validation record above are
+unchanged. The target is rendering CPU time. This can also improve factory
+simulation throughput when rendering competes for CPU time, cache or memory
+bandwidth, even without changing simulation algorithms. Whether UPS improves
+depends on the actual bottleneck and needs measurement.
+
+The first CPU changes should reduce repeated allocation lookups and progress
+calculations in shell reconciliation while preserving the current eligibility
+decisions and vanilla fallback. Broader structural caching needs demonstrated
+invalidation coverage, including changes made by other mods. Diagnostics must
+confirm that batching is active: the current render guard bypasses it when
+`PerformanceMonitor.GpuProfilerOn` is true.
+
+Changed-range uploads are the next bounded proposal. Start with progress and
+shell appearance buffers, whose individual writes currently dirty whole arrays.
+Unity 2022.3 provides an
+[offset/count SetData overload](https://docs.unity3d.com/2022.3/Documentation/ScriptReference/ComputeBuffer.SetData.html).
+Track and combine dirty intervals, with full uploads after buffer replacement
+or pool compaction and when fragmented changes make small submissions costly.
+Audit direct array writes and public dirty flags so no update can be omitted.
+Keep public dirty flags as independent force-full-upload signals; a precise
+pending range must not hide a simultaneous untracked write marked by that flag.
+Retain pending changes after a failed upload. Tests should compare the resulting
+buffer contents against full uploads through edits, growth, removals and retries.
+This proposal needs no shader or allocation-policy change; actual driver cost
+and frame-time benefit still require native measurements.
+
+GPU capacity reuse is deferred from this first pass. It is feasible, but its
+safety depends on keeping live draw counts separate from capacity, initializing
+every referenced record, preserving buffer bindings and respecting queued-draw
+lifetimes during replacement and teardown. Spare capacity also retains more
+memory. Source review does not establish freedom from native crashes.
+
+### Deferred: conservative shell visibility culling
+
+Do not implement or activate culling in this first optimization pass. The
+existence of a shell on an outer layer does not prove that an inner hex is
+occluded. Any future occlusion design must account for actual polygon coverage,
+holes, construction progress and rendered opacity, as well as layer visibility
+masks and camera position. Shell rotation, inside/outside views, editor and
+starmap scaling, and the current shader's distance compression also affect the
+result. Frustum rejection and occlusion are separate questions.
+
+The conservative rule is to keep drawing a hex when invisibility is uncertain.
+Future acceptance needs image comparisons against the unculled path for
+overlapping partial shells, openings, differing shapes, moving layers and all
+supported views. A higher layer ID or a complete-shell flag alone is insufficient
+evidence of coverage. Preserve this work for a separate design and validation
+effort after the CPU and upload changes have been assessed.
