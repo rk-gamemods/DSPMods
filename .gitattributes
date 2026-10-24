@@ -1,0 +1,3 @@
+# Git mail patches contain required context prefixes and binary payloads.
+# Preserve archive bytes; validate their source with verify_sphereopt_patch.py.
+/patches/SphereOpt-current-game.patch -text -whitespace
