@@ -2,13 +2,18 @@
 
 This repository owns DSP analysis tools, validation contracts and research.
 Its workflow covers private game-code capture, indexing, offline assessment and
-publication of workspace-owned tools and research. Deployment, game-file edits,
-game launches and changes to SphereOpt's behavior need separate instructions.
+publication of workspace-owned tools and research, and the requested current-game
+SphereOpt source update. Deployment, game-file edits and game launches remain
+outside this workflow unless explicitly requested.
 
 ## Boundaries
 
 - `external/SphereOpt/` is an independent, ignored Git clone. Inspect its own
   status before changes. Preserve its upstream source and notices.
+- The current update retains vanilla node/frame drawing. Do not activate legacy
+  replacement shaders or culling merely because their C# source compiles.
+- Keep the canonical Unity-project shell source, delivered bundle, runtime hash
+  pin and `SHADER_PROVENANCE.json` synchronized. Run the shader identity check.
 - `.local/` holds private game assembly snapshots, decompiled source, reports
   and machine-specific metadata. Never commit or publish these inputs.
 - `sources.json` records the upstream revision used for this assessment.

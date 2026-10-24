@@ -7,7 +7,12 @@
     "reviewed_release": "0.9.2",
     "release_url": "https://thunderstore.io/package/download/Andy/SphereOpt/0.9.2/",
     "release_zip_sha256": "54caaf8426b4e3a0c5f0da6d9330593bb94baefe3cb61dffd92a4dd2c582dbc9",
-    "release_dll_sha256": "1af8872de34751a4d6f1a9f42aa9dc1100e189406b6207697c646d9f0b3616d0"
+    "release_dll_sha256": "1af8872de34751a4d6f1a9f42aa9dc1100e189406b6207697c646d9f0b3616d0",
+    "candidate_version": "0.9.3",
+    "candidate_commit": "7a566ddad93ab58529c02fa3778d929eb747aa85",
+    "candidate_tree": "0312adaa128aae37021789978e32a9534b13ffa9",
+    "candidate_patch": "patches/SphereOpt-current-game.patch",
+    "candidate_bundle_sha256": "ea9719ae0307a1bbf07fae22f4c6dff485091a6ab4610065a2ba1883564ba75b"
   },
   "assessment": {
     "date": "2026-10-23",

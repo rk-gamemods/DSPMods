@@ -29,6 +29,7 @@ class SphereOptIndexTests(unittest.TestCase):
         files = {"Mod.cs": b"class Mod {}", "shaders/Test.shader": b'Shader "Test" {}',
                  "shaders/Test.compute": b"void CSMain() {}", "shaders/Common.cginc": b"float common;",
                  "ProjectSettings.asset": "name: sample".encode("utf-16"),
+                 "tests/regression.py": b"def check(): return True\n",
                  "README.md": b"# Fixture\n\n```\nexample\n```\n", ".gitignore": b"LocalIgnored.txt\n",
                  "bundle": b"UnityFS\0binary\0"}
         for name, content in files.items():
@@ -58,7 +59,7 @@ class SphereOptIndexTests(unittest.TestCase):
         first = indexing.prepare(self.clone, self.state)
         second = indexing.prepare(self.clone, self.state)
         self.assertEqual(first, second)
-        self.assertEqual((first["tracked_files"], first["text_files"], first["binary_files"], first["implementation_files"]), (8, 7, 1, 4))
+        self.assertEqual((first["tracked_files"], first["text_files"], first["binary_files"], first["implementation_files"]), (9, 8, 1, 5))
         self.assertEqual(indexing.git(self.clone, "status", "--porcelain"), "")
         readme = next(r for r in first["files"] if r["path"] == "README.md")
         projected = (Path(first["text_index_root"]) / readme["document"]).read_bytes()
@@ -88,11 +89,12 @@ class SphereOptIndexTests(unittest.TestCase):
                     "text_docs": list(hashes), "body_readback": {
                         name: {"content_hash": digest, "hash_verified": True, "source_hash_verified": True}
                         for name, digest in hashes.items()}}
-        self.assertEqual(indexing.verify_inventory(manifest, observed)["implementation_files_covered"], 4)
-        observed["code_files"].remove("shaders/Test.compute")
-        with self.assertRaisesRegex(RuntimeError, "Implementation source is missing"):
-            indexing.verify_inventory(manifest, observed)
-        observed["code_files"].append("shaders/Test.compute")
+        self.assertEqual(indexing.verify_inventory(manifest, observed)["implementation_files_covered"], 5)
+        for name in ("shaders/Test.compute", "tests/regression.py"):
+            observed["code_files"].remove(name)
+            with self.assertRaisesRegex(RuntimeError, "Implementation source is missing"):
+                indexing.verify_inventory(manifest, observed)
+            observed["code_files"].append(name)
         observed["body_readback"][next(iter(hashes))]["source_hash_verified"] = False
         with self.assertRaisesRegex(RuntimeError, "content was not verified"):
             indexing.verify_inventory(manifest, observed)

@@ -4,7 +4,7 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>SphereOpt</AssemblyName>
     <RootNamespace>SphereOpt</RootNamespace>
-    <Version>0.9.2</Version>
+    <Version>0.9.3</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <PlatformTarget>x64</PlatformTarget>
@@ -18,7 +18,7 @@
     <Compile Include="../../external/SphereOpt/*.cs" />
     <Compile Include="../../external/SphereOpt/thirdparty/**/*.cs" />
     <PackageReference Include="BepInEx.Core" Version="5.4.17" />
-    <PackageReference Include="BepInEx.PluginInfoProps" Version="1.*" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="1.1.0" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
     <Reference Include="$(DSPManagedDir)/*.dll"
                Exclude="$(DSPManagedDir)/mscorlib.dll;$(DSPManagedDir)/netstandard.dll;$(DSPManagedDir)/System*.dll;$(DSPManagedDir)/Microsoft*.dll;$(DSPManagedDir)/Mono*.dll">

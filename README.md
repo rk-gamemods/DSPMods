@@ -4,9 +4,12 @@ Tools and research for local source review, game-code capture and offline
 compatibility checks. Game binaries, reconstructed source and indexes stay
 private. No command here installs a mod or starts the game.
 
-The [SphereOpt assessment](docs/SPHEREOPT_ASSESSMENT.md) finds that its rendering
-approach remains relevant to DSP 0.10.35.29151. The released 0.9.2 DLL passes
-metadata checks; runtime, shader and performance compatibility remain untested.
+The [current SphereOpt investigation and update](docs/SPHEREOPT_UPDATE.md)
+establishes continued value for shell batching in DSP 0.10.35.29151. The local
+0.9.3 update builds against captured current-game DLLs and includes repaired
+shell programs. It retains vanilla node/frame rendering. Build and offline
+contracts do not establish in-game visuals or a performance gain. The
+[initial 0.9.2 assessment](docs/SPHEREOPT_ASSESSMENT.md) records the baseline.
 
 ## Prepare
 
@@ -17,6 +20,15 @@ py -3 tools/game_snapshot.py capture
 ```
 
 The clone command is only needed when the independent clone is absent. The
+upstream checkout is the old baseline. For a fresh clone, apply the reviewed
+update before running the current mod checks:
+
+```powershell
+git -C external/SphereOpt switch -c rk/current-game-compat a06ca9a7bd53d907bea6160eec333b8b30336574
+git -C external/SphereOpt am ../../patches/SphereOpt-current-game.patch
+```
+
+An already-updated local clone does not need those two commands. The game
 capture discovers Steam libraries, snapshots the installed managed DLLs and
 decompiles every managed DLL using the pinned ILSpy tool. Override discovery
 with `--game 'D:\SteamLibrary\steamapps\common\Dyson Sphere Program'`.
@@ -37,22 +49,19 @@ dotnet run --project tools/OfflineChecks -c Release --no-build -- self-test
 py -3 -m unittest discover -s tests -v
 ```
 
-The separate offline build project compiles the unchanged SphereOpt source
-against captured installed-game assemblies. It does not edit the upstream
-project or deploy its output. Its output is analysis material, not a packaged
-release with a validated shader bundle.
-
-Building unchanged SphereOpt against unmodified installed DLLs reports seven
-access errors involving six private fields. All six fields still exist. This
-differs from the upstream publicized reference setup and does not establish
-runtime incompatibility. To inspect the published plugin, run `check-mod` against
-its separately downloaded DLL. That released 0.9.2 DLL passed 351 reference and
-15 Harmony target checks for the assessed game build.
-
-To reproduce the source-build access errors:
+The separate build project compiles the updated independent clone against
+verified, unmodified installed-game DLLs. It never deploys its output. Current
+private-field access uses typed cached Harmony accessors rather than publicized
+reference assemblies. The upstream baseline's original access failures are
+recorded in the initial assessment.
 
 ```powershell
 dotnet build tools/SphereOpt.OfflineBuild -c Release
+dotnet run --project external/SphereOpt/tests/SphereOpt.Tests -c Release
+dotnet run --project external/SphereOpt/tests/SphereOpt.LayerTests -c Release
+dotnet run --project external/SphereOpt/tests/SphereOpt.RenderTests -c Release
+py -3 tools/check_sphereopt_shaders.py
+py -3 tools/game_snapshot.py check-mod .local/build/SphereOpt/SphereOpt.dll
 ```
 
 If capture uses an explicit game path, pass the same selection to the build:
@@ -64,11 +73,32 @@ dotnet build tools/SphereOpt.OfflineBuild -c Release '-p:DSPGameDir=D:\SteamLibr
 The build checks that its `DSPManagedDir` is the latest verified snapshot's
 managed directory. Overrides pointing at different inputs are rejected.
 
-The metadata checker finds missing game/Unity member references and common
-Harmony target/argument mismatches. It does not execute plugin initializers,
-apply Harmony patches, validate shader rendering or benchmark FPS. Transpiler
-instruction matching requires additional review. See
+The checker finds missing game/Unity members, typed reflected-field mismatches,
+Harmony target/argument mismatches and the selected current-game instruction
+contracts. Executable tests link real production helpers and layer/context code
+through isolated fixtures. These do not execute plugin initializers, apply
+patches to the live game, validate shader rendering or benchmark FPS. See
 [workflow and contracts](docs/WORKFLOW.md).
+
+The [instruction checker](tools/SphereOpt.InstructionChecks/README.md) runs both
+real transformers over the captured game IL without loading the game. It checks
+the exact substitutions, surrounding loop/overlay semantics and preserved
+labels, locals and finally boundaries.
+
+```powershell
+py -3 tools/verify_sphereopt_patch.py
+```
+
+That command reconstructs the reviewed tree using an isolated Git index and
+leaves the clone's working tree and normal index untouched.
+
+The local package command requires a reviewed, committed, clean clone. It
+rebuilds, verifies game inputs, checks plugin identity and shader provenance,
+and verifies deterministic ZIP contents. Output remains private under `.local/`.
+
+```powershell
+py -3 tools/package_sphereopt.py
+```
 
 ## Index all managed source privately
 
@@ -135,4 +165,5 @@ use this workflow for SphereOpt refreshes. See the
 - [Task scope and workflow](docs/WORKFLOW.md)
 - [Pinned upstream source](sources.json)
 - [SphereOpt relevance and compatibility assessment](docs/SPHEREOPT_ASSESSMENT.md)
+- [Current-game research, fixes and validation](docs/SPHEREOPT_UPDATE.md)
 - [SphereOpt upstream](https://github.com/andyoneal/SphereOpt)

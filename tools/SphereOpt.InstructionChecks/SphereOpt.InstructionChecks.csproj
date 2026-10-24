@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="Exists('$(MSBuildProjectDirectory)/packages.lock.json')">true</RestoreLockedMode>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="HarmonyX" Version="[2.5.5]" />
+    <PackageReference Include="Mono.Cecil" Version="[0.11.6]" />
+    <Compile Include="../../external/SphereOpt/ShellCursorRewriter.cs" Link="Production/ShellCursorRewriter.cs" />
+    <Compile Include="../../external/SphereOpt/ColorStoreRewriter.cs" Link="Production/ColorStoreRewriter.cs" />
+  </ItemGroup>
+</Project>

@@ -5,7 +5,7 @@ using Mono.Cecil.Cil;
 namespace DspOfflineChecks;
 
 record Finding(string Kind, string Subject, string Detail);
-record CheckReport(string Status, int CheckedReferences, int CheckedPatchTargets,
+record CheckReport(string Status, int CheckedReferences, int CheckedPatchTargets, int CheckedInstructionContracts,
     List<Finding> Errors, string[] Limits);
 
 static class Program
@@ -13,7 +13,7 @@ static class Program
     static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     static readonly string[] Limits = [
         "Metadata inspection only: game and plugin code were not executed.",
-        "Transpiler instruction matching/application is not validated.",
+        "Only reported instruction contracts were checked; Harmony patch application was not executed.",
         "Native Unity behavior, shaders, visuals, saves and performance require runtime tests."
     ];
 
@@ -22,6 +22,19 @@ static class Program
         try
         {
             if (args.Length == 1 && args[0] == "self-test") return SelfTest();
+            if (args.Length == 2 && args[0] == "identity")
+            {
+                using var assembly = AssemblyDefinition.ReadAssembly(args[1]);
+                var plugin = Types(assembly.MainModule.Types).SelectMany(t => t.CustomAttributes)
+                    .Single(a => a.AttributeType.FullName == "BepInEx.BepInPlugin");
+                Console.WriteLine(JsonSerializer.Serialize(new {
+                    assembly = assembly.Name.Name, assemblyVersion = assembly.Name.Version.ToString(),
+                    guid = plugin.ConstructorArguments[0].Value,
+                    name = plugin.ConstructorArguments[1].Value,
+                    version = plugin.ConstructorArguments[2].Value
+                }, JsonOptions));
+                return 0;
+            }
             if (args.Length == 4 && args[0] == "instructions")
             {
                 using var assembly = AssemblyDefinition.ReadAssembly(args[1]);
@@ -48,7 +61,7 @@ static class Program
                 return 0;
             }
             if (args.Length == 0 || args[0] != "check")
-                throw new ArgumentException("Usage: check --managed DIR --mod FILE --report FILE | describe FILE TYPE | instructions FILE TYPE METHOD | self-test");
+                throw new ArgumentException("Usage: check --managed DIR --mod FILE --report FILE | identity FILE | describe FILE TYPE | instructions FILE TYPE METHOD | self-test");
             string Option(string name)
             {
                 var i = Array.IndexOf(args, name);
@@ -60,7 +73,7 @@ static class Program
             Directory.CreateDirectory(Path.GetDirectoryName(output)!);
             File.WriteAllText(output, JsonSerializer.Serialize(report, JsonOptions) + "\n");
             Console.WriteLine($"{report.Status}: {report.CheckedReferences} references, " +
-                $"{report.CheckedPatchTargets} Harmony targets, {report.Errors.Count} errors.");
+                $"{report.CheckedPatchTargets} Harmony targets, {report.CheckedInstructionContracts} instruction contracts, {report.Errors.Count} errors.");
             foreach (var error in report.Errors.Take(20))
                 Console.WriteLine($"{error.Kind}: {error.Subject}: {error.Detail}");
             Console.WriteLine("Full report: " + output);
@@ -100,6 +113,7 @@ static class Program
         var errors = new List<Finding>();
         var references = 0;
         var patches = 0;
+        var contracts = 0;
         using var resolver = new DefaultAssemblyResolver();
         resolver.AddSearchDirectory(managed);
         resolver.AddSearchDirectory(Path.GetDirectoryName(plugin)!);
@@ -147,6 +161,33 @@ static class Program
         foreach (var type in Types(mod.MainModule.Types))
         foreach (var method in type.Methods)
         {
+            if (method.HasBody)
+            foreach (var instruction in method.Body.Instructions)
+            {
+                if (instruction.Operand is not GenericInstanceMethod accessor ||
+                    accessor.DeclaringType.FullName != "HarmonyLib.AccessTools" || accessor.Name != "FieldRefAccess") continue;
+                references++;
+                if (accessor.GenericArguments.Count != 2 || accessor.Parameters.Count != 1 ||
+                    accessor.Parameters[0].ParameterType.FullName != "System.String" ||
+                    instruction.Previous?.OpCode != OpCodes.Ldstr)
+                {
+                    errors.Add(new("UnsupportedFieldAccessor", method.FullName,
+                        "Requires a typed instance FieldRefAccess<T,F> with a literal field name."));
+                    continue;
+                }
+                var fieldName = (string)instruction.Previous.Operand;
+                try
+                {
+                    var owner = accessor.GenericArguments[0].Resolve();
+                    var field = owner?.Fields.SingleOrDefault(f => f.Name == fieldName);
+                    if (field == null || field.IsStatic)
+                        errors.Add(new("MissingReflectedField", method.FullName, accessor.GenericArguments[0].FullName + "." + fieldName));
+                    else if (field.FieldType.FullName != accessor.GenericArguments[1].FullName)
+                        errors.Add(new("ReflectedFieldTypeMismatch", method.FullName,
+                            $"{fieldName}: expected {accessor.GenericArguments[1].FullName}, captured {field.FieldType.FullName}."));
+                }
+                catch (Exception ex) { errors.Add(new("UnresolvedReflectedField", method.FullName, ex.Message)); }
+            }
             var attributes = PatchAttributes(type).Concat(PatchAttributes(method)).ToArray();
             var isPatch = method.CustomAttributes.Any(a => a.AttributeType.Namespace == "HarmonyLib" &&
                 a.AttributeType.Name is "HarmonyPrefix" or "HarmonyPostfix" or "HarmonyTranspiler" or "HarmonyFinalizer")
@@ -202,6 +243,13 @@ static class Program
                 }
                 if (name is "__instance" or "__result")
                 {
+                    if (name == "__instance" && candidates[0].IsStatic)
+                    {
+                        // HarmonyX 2.5.5 emits ldnull for a static original.
+                        if (injected.ParameterType is ByReferenceType || injected.ParameterType.IsValueType)
+                            errors.Add(new("StaticTargetInstanceType", method.FullName, "Static __instance requires a by-value reference type."));
+                        continue;
+                    }
                     var expected = name == "__instance" ? target.FullName : candidates[0].ReturnType.FullName;
                     if (PlainType(injected.ParameterType) != expected && PlainType(injected.ParameterType) != "System.Object")
                         errors.Add(new("InjectedTypeMismatch", method.FullName, $"{name}: expected {expected}."));
@@ -218,8 +266,36 @@ static class Program
                         $"{name}: patch {injected.ParameterType.FullName}, target {original.ParameterType.FullName}."));
             }
         }
-        return new(errors.Count == 0 ? "PASS_WITH_LIMITATIONS" : "FAIL", references, patches, errors, Limits);
+        if (Types(mod.MainModule.Types).Any(t => t.FullName == "SphereOpt.ShellCursorRewriter"))
+        {
+            contracts++;
+            CheckInstructionContract(resolver, "DysonSphereSegmentRenderer", "DrawModels", "DysonSphereLayer", "shellCursor", OpCodes.Ldfld, 2, errors);
+        }
+        if (Types(mod.MainModule.Types).Any(t => t.FullName == "SphereOpt.ColorStoreRewriter"))
+        {
+            contracts++;
+            CheckInstructionContract(resolver, "UIDysonBrush_Paint", "_OnUpdate", "DysonShell", "color", OpCodes.Stfld, 1, errors);
+        }
+        return new(errors.Count == 0 ? "PASS_WITH_LIMITATIONS" : "FAIL", references, patches, contracts, errors, Limits);
     }
+
+    static void CheckInstructionContract(IAssemblyResolver resolver, string owner, string methodName,
+        string fieldOwner, string fieldName, OpCode opcode, int expected, List<Finding> errors)
+    {
+        try
+        {
+            var game = resolver.Resolve(new AssemblyNameReference("Assembly-CSharp", new Version(0, 0)));
+            var method = Types(game.MainModule.Types).Single(t => t.FullName == owner).Methods.Single(m => m.Name == methodName);
+            var actual = CountFieldInstructions(method, fieldOwner, fieldName, opcode);
+            if (actual != expected) errors.Add(new("InstructionContractMismatch", method.FullName,
+                $"Expected {expected} {opcode.Name} {fieldOwner}.{fieldName}, found {actual}."));
+        }
+        catch (Exception ex) { errors.Add(new("UnresolvedInstructionContract", owner + "." + methodName, ex.Message)); }
+    }
+
+    static int CountFieldInstructions(MethodDefinition method, string owner, string field, OpCode opcode) =>
+        method.Body.Instructions.Count(i => i.OpCode == opcode && i.Operand is FieldReference reference &&
+            reference.DeclaringType.FullName == owner && reference.Name == field);
 
     static int SelfTest()
     {
@@ -231,13 +307,15 @@ static class Program
             using var game = AssemblyDefinition.CreateAssembly(new("FixtureGame", new(1, 0)), "FixtureGame", ModuleKind.Dll);
             var target = new TypeDefinition("Fixture", "Target", TypeAttributes.Public, game.MainModule.TypeSystem.Object);
             game.MainModule.Types.Add(target);
+            target.Fields.Add(new("privateValue", FieldAttributes.Private, game.MainModule.TypeSystem.Int32));
             var targetMethod = new MethodDefinition("Work", MethodAttributes.Public | MethodAttributes.Static,
                 game.MainModule.TypeSystem.Void);
             targetMethod.Parameters.Add(new("amount", ParameterAttributes.None, game.MainModule.TypeSystem.Int32));
             targetMethod.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
             target.Methods.Add(targetMethod);
             game.Write(gameFile);
-            foreach (var test in new[] { ("Work", "amount", false), ("Missing", "amount", true), ("Work", "unknown", true) })
+            foreach (var test in new[] { ("Work", "amount", false, 0), ("Missing", "amount", true, 0), ("Work", "unknown", true, 0),
+                         ("Work", "__instance", false, 1), ("Work", "__instance", true, 2), ("Work", "__instance", true, 3) })
             {
                 var modFile = Path.Combine(root, "FixtureMod.dll");
                 using var mod = AssemblyDefinition.CreateAssembly(new("FixtureMod", new(1, 0)), "FixtureMod", ModuleKind.Dll);
@@ -245,7 +323,12 @@ static class Program
                 var patchType = new TypeDefinition("Fixture", "Patches", TypeAttributes.Public, module.TypeSystem.Object);
                 module.Types.Add(patchType);
                 var prefix = new MethodDefinition("Prefix", MethodAttributes.Public | MethodAttributes.Static, module.TypeSystem.Boolean);
-                prefix.Parameters.Add(new(test.Item2, ParameterAttributes.None, module.TypeSystem.Int32));
+                TypeReference injectionType = test.Item4 switch {
+                    1 => module.TypeSystem.Object,
+                    3 => new ByReferenceType(module.TypeSystem.Object),
+                    _ => module.TypeSystem.Int32
+                };
+                prefix.Parameters.Add(new(test.Item2, ParameterAttributes.None, injectionType));
                 prefix.Body.Instructions.Add(Instruction.Create(OpCodes.Ldc_I4_1));
                 prefix.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
                 patchType.Methods.Add(prefix);
@@ -286,6 +369,42 @@ static class Program
                         JsonSerializer.Serialize(report, JsonOptions));
                 Console.WriteLine($"PASS: missing {assemblyName}, expected rejection=True");
             }
+            foreach (var test in new[] { ("privateValue", false, ""), ("missing", false, "MissingReflectedField"),
+                         ("privateValue", true, "ReflectedFieldTypeMismatch") })
+            {
+                var modFile = Path.Combine(root, "FieldAccessorMod.dll");
+                using var mod = AssemblyDefinition.CreateAssembly(new("FieldAccessorMod", new(1, 0)), "FieldAccessorMod", ModuleKind.Dll);
+                var module = mod.MainModule;
+                var fixture = new TypeDefinition("Fixture", "Accessors", TypeAttributes.Public, module.TypeSystem.Object);
+                module.Types.Add(fixture);
+                var method = new MethodDefinition("Initialize", MethodAttributes.Public | MethodAttributes.Static, module.TypeSystem.Void);
+                fixture.Methods.Add(method);
+                var accessTools = new TypeReference("HarmonyLib", "AccessTools", module, new AssemblyNameReference("FakeHarmony", new(1, 0)));
+                var declaration = new MethodReference("FieldRefAccess", module.TypeSystem.Object, accessTools);
+                declaration.GenericParameters.Add(new("T", declaration));
+                declaration.GenericParameters.Add(new("F", declaration));
+                declaration.Parameters.Add(new(module.TypeSystem.String));
+                var accessor = new GenericInstanceMethod(declaration);
+                accessor.GenericArguments.Add(module.ImportReference(target));
+                accessor.GenericArguments.Add(test.Item2 ? module.TypeSystem.String : module.TypeSystem.Int32);
+                method.Body.Instructions.Add(Instruction.Create(OpCodes.Ldstr, test.Item1));
+                method.Body.Instructions.Add(Instruction.Create(OpCodes.Call, accessor));
+                method.Body.Instructions.Add(Instruction.Create(OpCodes.Pop));
+                method.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+                mod.Write(modFile);
+                var report = Check(root, modFile);
+                if (test.Item3 == "" ? report.Errors.Count != 0 : !report.Errors.Any(e => e.Kind == test.Item3))
+                    throw new InvalidOperationException("Reflected-field self-test mismatch: " + JsonSerializer.Serialize(report, JsonOptions));
+                Console.WriteLine($"PASS: reflected {test.Item1}, wrongType={test.Item2}, expected={test.Item3}");
+            }
+            var instructionFixture = new MethodDefinition("RenderFixture", MethodAttributes.Static, game.MainModule.TypeSystem.Void);
+            foreach (var op in new[] { OpCodes.Ldfld, OpCodes.Ldfld, OpCodes.Stfld })
+                instructionFixture.Body.Instructions.Add(Instruction.Create(op, target.Fields[0]));
+            if (CountFieldInstructions(instructionFixture, target.FullName, "privateValue", OpCodes.Ldfld) != 2 ||
+                CountFieldInstructions(instructionFixture, target.FullName, "other", OpCodes.Ldfld) != 0 ||
+                CountFieldInstructions(instructionFixture, target.FullName, "privateValue", OpCodes.Stfld) != 1)
+                throw new InvalidOperationException("Instruction contract counting self-test failed.");
+            Console.WriteLine("PASS: instruction contracts distinguish field and opcode");
             return 0;
         }
         finally { Directory.Delete(root, recursive: true); }

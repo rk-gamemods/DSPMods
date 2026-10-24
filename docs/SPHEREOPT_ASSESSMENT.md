@@ -1,5 +1,8 @@
 # SphereOpt assessment for DSP 0.10.35.29151
 
+This is the baseline 0.9.2 assessment. See the [current-game update](SPHEREOPT_UPDATE.md)
+for the later source changes, shader repairs and validation results.
+
 Assessed 2026-10-23. SphereOpt's rendering approach remains relevant to the
 installed game. Its released 0.9.2 DLL passes the workspace's metadata checks.
 This supports further runtime testing; it does not establish that the mod is

@@ -14,7 +14,7 @@ import tomllib
 from game_snapshot import ROOT, output_path, sha256, write_json
 
 
-SOURCE_SUFFIXES = {".cs", ".shader", ".compute", ".cginc"}
+SOURCE_SUFFIXES = {".cs", ".shader", ".compute", ".cginc", ".py"}
 EXTRA_EXTENSIONS = {
     ".shader": "cpp", ".compute": "cpp", ".cginc": "cpp",
     ".asset": "yaml", ".unity": "yaml", ".asmdef": "json",
