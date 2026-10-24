@@ -14,6 +14,8 @@ contracts do not establish in-game visuals or a performance gain. The
 The [installed optimization-stack review](docs/OPTIMIZATION_STACK.md) covers
 Weaver, DSPOptimizations and BuildToolOpt, their overlap with SphereOpt, and
 the combined patch checks needed before further optimization.
+The [CPU and compatibility follow-up](docs/SPHEREOPT_CPU_UPDATE.md) records the
+latest unofficial 0.9.3 candidate's paint ordering, reconciliation and uploads.
 
 ## Prepare
 

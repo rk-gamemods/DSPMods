@@ -14,11 +14,18 @@ foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies()) Record(assembl
 AppDomain.CurrentDomain.AssemblyLoad += (_, eventArgs) => Record(eventArgs.LoadedAssembly);
 try
 {
-    Check.That(args.Length is 2 or 4 && args[0] == "--assembly" &&
-        (args.Length == 2 || args[2] == "--report"),
-        "Usage: --assembly <captured Assembly-CSharp.dll> [--report <local JSON path>]");
+    const string usage = "Usage: --assembly <captured Assembly-CSharp.dll> [--plugin <candidate SphereOpt.dll>] " +
+        "[--dsp-optimizations <reviewed DSPOptimizations 1.1.19 DLL>] [--report <local JSON path>]";
+    Check.That(args.Length >= 2 && args.Length % 2 == 0, usage);
+    var options = new Dictionary<string, string>(StringComparer.Ordinal);
+    for (var i = 0; i < args.Length; i += 2)
+        Check.That(new[] { "--assembly", "--plugin", "--dsp-optimizations", "--report" }.Contains(args[i]) &&
+            !string.IsNullOrWhiteSpace(args[i + 1]) && options.TryAdd(args[i], args[i + 1]), usage);
+    Check.That(options.ContainsKey("--assembly"), usage);
     AssertIsolation();
-    var bytes = File.ReadAllBytes(args[1]);
+    var bytes = File.ReadAllBytes(options["--assembly"]);
+    using var plugin = options.TryGetValue("--plugin", out var pluginPath) ? new ProofMetadata(pluginPath) : null;
+    using var dspo = options.TryGetValue("--dsp-optimizations", out var dspoPath) ? new ProofMetadata(dspoPath) : null;
     using var stream = new MemoryStream(bytes, writable: false);
     using var assembly = AssemblyDefinition.ReadAssembly(stream, new ReaderParameters
     {
@@ -109,6 +116,8 @@ try
     SemanticNegative("missing-overlay-fallthrough", copy => copy[semantic.CursorIndices[1] + 3].OpCode = Mono.Cecil.Cil.OpCodes.Nop);
     drawInput.AssertRawUnchanged();
     paintInput.AssertRawUnchanged();
+    var stack = StackChecks.Run(module, paintInput, stores[0], dspo);
+    var patchOrdering = PatchOrderChecks.Run(plugin, dspo);
     AssertIsolation();
     var report = new
     {
@@ -118,23 +127,30 @@ try
         semantics = new { sameLayerLocal = semantic.LayerLocal, firstFeedsSignedRem = true,
             secondFeedsSignedBltLoop = true, shellIndexStartsAtOne = true, overlayIsDirectFallthrough = true },
         negativeControls = new { passed = controls.Count, cases = controls },
+        stackInteroperation = stack, patchOrdering,
+        compiledSourceInputs = ProofMetadata.CompiledSources(),
+        dependencies = new[] { typeof(CodeMatcher).Assembly, typeof(AssemblyDefinition).Assembly }.Select(a => new
+            { name = a.GetName().Name, version = a.GetName().Version.ToString(), sha256 = ProofMetadata.Hash(File.ReadAllBytes(a.Location)) }).ToArray(),
         isolation = new { forbiddenAssembliesObserved = 0, observedAssemblyCount = loaded.Count,
-            checkedAssemblyNames = new[] { "Assembly-CSharp*", "UnityEngine*", "BepInEx*", "SphereOpt" }, externalAssemblyResolution = "rejected" },
+            checkedAssemblyNames = new[] { "Assembly-CSharp*", "UnityEngine*", "BepInEx*", "SphereOpt", "DSPOptimizations", "*Weaver*", "*BuildToolOpt*" }, externalAssemblyResolution = "rejected" },
         limits = new[]
         {
             "Cecil reads captured bytes as data; game and plugin assemblies are never loaded or executed.",
             "Only target FieldReferences with validated owner, name, type and both owner/type scopes map to fixture FieldInfo because the helpers require it.",
             "Fixture fields and replacement MethodInfo are not game runtime types or production patch methods; no game ABI or behavior proof.",
+            "Two precisely validated captured instance-void MethodReferences also map to fixture methods for the DSPOptimizations transforms.",
+            "SphereBufferOpt's EmitDelegate becomes a metadata-only four-argument fixture call; no callback, injected-field, dirty-mask or preloader behavior proof.",
+            "Optional candidate metadata drives the real Harmony sorter using attribute-free local methods; no actual plugin patch registration is tested.",
             "Other operands retain identity, including Cecil branch/switch objects; real labels attach to actual branch destinations.",
             "Actual disjoint finally regions map to Harmony boundary blocks; other EH shapes fail closed.",
             "No Harmony patch application, IL emission, delegate compilation, Unity graphics test, or game execution."
         }
     };
     var json = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
-    Check.That(System.Text.Encoding.UTF8.GetByteCount(json + Environment.NewLine) < 16384,
-        "Success report exceeded its fixed 16 KiB bound");
+    Check.That(System.Text.Encoding.UTF8.GetByteCount(json + Environment.NewLine) < 32768,
+        "Success report exceeded its fixed 32 KiB bound");
     AssertIsolation();
-    if (args.Length == 4) File.WriteAllText(args[3], json + Environment.NewLine);
+    if (options.TryGetValue("--report", out var reportPath)) File.WriteAllText(reportPath, json + Environment.NewLine);
     Console.WriteLine(json);
     return 0;
 
@@ -144,7 +160,10 @@ try
             name.StartsWith("Assembly-CSharp", StringComparison.OrdinalIgnoreCase) ||
             name.StartsWith("UnityEngine", StringComparison.OrdinalIgnoreCase) ||
             name.StartsWith("BepInEx", StringComparison.OrdinalIgnoreCase) ||
-            name.Equals("SphereOpt", StringComparison.OrdinalIgnoreCase)), "Forbidden game or plugin assembly loaded");
+            name.Equals("SphereOpt", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("DSPOptimizations", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Weaver", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("BuildToolOpt", StringComparison.OrdinalIgnoreCase)), "Forbidden game or plugin assembly loaded");
     }
     void RejectCursor(List<CodeInstruction> input, string name)
     {
@@ -178,7 +197,11 @@ internal sealed class RejectResolution : IAssemblyResolver
 internal sealed class LayerFixture { public int shellCursor = 0; }
 internal sealed class ForeignLayerFixture { public int shellCursor = 0; }
 internal readonly record struct FixtureColor(byte R, byte G, byte B, byte A);
-internal sealed class ShellFixture { public FixtureColor color = default; }
+internal sealed class ShellFixture
+{
+    public FixtureColor color = default;
+    public void SetMaterialDynamicVars() => throw new NotSupportedException("Metadata-only fixture");
+}
 internal sealed class ForeignShellFixture { public FixtureColor color = default; }
 internal static class FixtureHooks
 {

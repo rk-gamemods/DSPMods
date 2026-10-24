@@ -37,4 +37,17 @@ internal static class Check
         ReferenceEquals(reference.FieldType.Scope, field.FieldType.Scope) &&
         ReferenceEquals(reference.Module, field.Module) && ReferenceEquals(reference.DeclaringType.Scope, field.Module) &&
         ReferenceEquals(reference.Resolve(), field); // Only resolve an already validated same-module owner.
+
+    internal static bool Matches(object operand, MethodDefinition method) => operand is MethodReference reference &&
+        reference.Name == method.Name && reference.DeclaringType.FullName == method.DeclaringType.FullName &&
+        ReferenceEquals(reference.Module, method.Module) && ReferenceEquals(reference.DeclaringType.Scope, method.Module) &&
+        reference.HasThis == method.HasThis && reference.ExplicitThis == method.ExplicitThis &&
+        reference.CallingConvention == method.CallingConvention &&
+        reference.GenericParameters.Count == method.GenericParameters.Count &&
+        SameType(reference.ReturnType, method.ReturnType) && reference.Parameters.Count == method.Parameters.Count &&
+        reference.Parameters.Select((p, i) => SameType(p.ParameterType, method.Parameters[i].ParameterType)).All(v => v) &&
+        ReferenceEquals(reference.Resolve(), method);
+
+    private static bool SameType(TypeReference left, TypeReference right) =>
+        left.FullName == right.FullName && ReferenceEquals(left.Scope, right.Scope);
 }

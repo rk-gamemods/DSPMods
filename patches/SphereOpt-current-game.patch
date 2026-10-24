@@ -1,8 +1,8 @@
 From 7a566ddad93ab58529c02fa3778d929eb747aa85 Mon Sep 17 00:00:00 2001
 From: Agent <agent@example.com>
 Date: Sat, 24 Oct 2026 00:24:31 -0400
-Subject: [PATCH] Update shell batching for current DSP with validated shaders
- and contracts
+Subject: [PATCH 1/2] Update shell batching for current DSP with validated
+ shaders and contracts
 
 ---
  CURRENT_GAME.md                               |  61 ++
@@ -18272,6 +18272,2764 @@ index bf65ef0320291c5e42b7494b64f8c977d44d1fa2..846e85d7f0e6a97c3e34e26bdd214d39
 -}
 \ No newline at end of file
 +}
+-- 
+2.51.0.windows.1
+
+
+From 0411bf590edc29e86a78caead151cf1269ef8b64 Mon Sep 17 00:00:00 2001
+From: Agent <agent@example.com>
+Date: Sat, 24 Oct 2026 11:56:12 -0400
+Subject: [PATCH 2/2] Reduce shell renderer CPU overhead and order
+ DSPOptimizations paint hooks
+
+---
+ CURRENT_GAME.md                               |  17 +-
+ DirtyRange.cs                                 |  26 +
+ InstDysonShellLayer.cs                        | 421 ++++++++------
+ InstDysonShellRenderer.cs                     |  14 +-
+ Patch_DysonShell.cs                           |   6 +-
+ Patch_DysonSphereSegmentRenderer.cs           |  64 ++-
+ ShellBatchPolicy.cs                           |  17 +-
+ tests/SphereOpt.LayerTests/LayerTests.cs      |  22 +-
+ .../PartialUploadTests.cs                     | 520 ++++++++++++++++++
+ tests/SphereOpt.LayerTests/Program.cs         |   2 +-
+ tests/SphereOpt.LayerTests/ReconcileTests.cs  | 199 +++++++
+ .../SphereOpt.LayerTests.csproj               |   2 +
+ tests/SphereOpt.LayerTests/UnityStubs.cs      |  28 +-
+ .../SphereOpt.RenderTests/AllocationTests.cs  |  89 +++
+ tests/SphereOpt.RenderTests/Fakes.cs          |  19 +-
+ .../PooledContextTests.cs                     | 360 ++++++++++++
+ tests/SphereOpt.RenderTests/Program.cs        |  18 +-
+ tests/SphereOpt.RenderTests/README.md         |  64 ++-
+ .../RenderContextTests.cs                     |   4 +
+ .../test_verification_gates.py                |  56 ++
+ .../verify_allocations.py                     |  67 +++
+ .../verify_counterfactuals.py                 | 198 +++++--
+ 22 files changed, 1942 insertions(+), 271 deletions(-)
+ create mode 100644 DirtyRange.cs
+ create mode 100644 tests/SphereOpt.LayerTests/PartialUploadTests.cs
+ create mode 100644 tests/SphereOpt.LayerTests/ReconcileTests.cs
+ create mode 100644 tests/SphereOpt.RenderTests/AllocationTests.cs
+ create mode 100644 tests/SphereOpt.RenderTests/PooledContextTests.cs
+ create mode 100644 tests/SphereOpt.RenderTests/test_verification_gates.py
+ create mode 100644 tests/SphereOpt.RenderTests/verify_allocations.py
+
+diff --git a/CURRENT_GAME.md b/CURRENT_GAME.md
+index 66501e5ff4836e10906f7bdff71fcc69979bb7c5..8466780d4d3a37f0c1cad541b77c19bf6890340c 100644
+--- a/CURRENT_GAME.md
++++ b/CURRENT_GAME.md
+@@ -1,6 +1,9 @@
+ # SphereOpt 0.9.3 current-game update
+ 
+-Unofficial compatibility update based on Andy O'Neal's SphereOpt 0.9.2.
++Unofficial local candidate based on andyoneal's SphereOpt 0.9.2. Version 0.9.3
++identifies this workspace's update; it is not a release by the upstream author.
++The assessed installed profile still contains upstream 0.9.2. Building this
++candidate does not install it.
+ Assessed against Dyson Sphere Program 0.10.35.29151, Steam build 25955035,
+ Unity 2022.3.62f3c1. Requires BepInEx 5.4.17 or a compatible installation.
+ 
+@@ -20,6 +23,18 @@ per-layer stencil materials, safe initialization and fallback, and bounded shell
+ pool storage across deletion and regeneration. Original game materials remain
+ available for fallback. Renderer ownership uses actual sphere/layer objects.
+ 
++The CPU follow-up resolves pool ownership once per shell during reconciliation
++and calculates each referenced progress value once. Structural readiness checks
++remain in place. Progress and appearance updates track a bounded changed span;
++resizing, compaction and public force-dirty flags retain full uploads. GPU buffer
++capacity and allocation policy are unchanged. Render calls reuse the layer array
++and submission callback while retaining a unique finalizer state for each call.
++
++The brush transpiler explicitly runs after DSPOptimizations' transpiler, which
++must see the original color store. Captured-IL and ordering checks supplement the
++isolated contracts. These checks do not certify live Harmony installation or the
++full Weaver/DSPOptimizations/BuildToolOpt stack.
++
+ The repaired shell shader supports construction progress and pole geometry.
+ Its exact bytes are required at startup; an old or mismatched bundle disables
+ the optimization and leaves vanilla available. See `SHADER_PROVENANCE.json` for
+diff --git a/DirtyRange.cs b/DirtyRange.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e975714b77712f286f3fded7c50400bfec04d4c5
+--- /dev/null
++++ b/DirtyRange.cs
+@@ -0,0 +1,26 @@
++namespace SphereOpt
++{
++    // One bounding span, including unchanged entries between tracked writes.
++    // The owning layer serializes updates and clears only after a successful upload.
++    internal struct DirtyRange
++    {
++        internal int Start { get; private set; }
++        private int end;
++        internal int Count => end - Start;
++        internal bool IsDirty => Count != 0;
++
++        internal void Include(int index)
++        {
++            if (!IsDirty)
++            {
++                Start = index;
++                end = index + 1;
++                return;
++            }
++            if (index < Start) Start = index;
++            if (index >= end) end = index + 1;
++        }
++
++        internal void Clear() { Start = 0; end = 0; }
++    }
++}
+diff --git a/InstDysonShellLayer.cs b/InstDysonShellLayer.cs
+index d69345e24e591a23be913f25bf5810663411f48d..ce573ae1b644fe6cf12244c581c91bc81f861ce1 100644
+--- a/InstDysonShellLayer.cs
++++ b/InstDysonShellLayer.cs
+@@ -12,7 +12,8 @@ namespace SphereOpt
+         }
+         public static int HEXPROGRESSDATA_STRIDE = 4;
+ 
+-        public struct PolygonData {
++        public struct PolygonData
++        {
+             public Vector3 pos;
+             public Vector3 normal;
+         }
+@@ -62,6 +63,8 @@ namespace SphereOpt
+         private ComputeBuffer shellBuffer;
+         private ComputeBuffer polygonBuffer;
+ 
++        // Public flags independently request a FULL upload, including when a
++        // precise span is pending. Direct public pool writes require this signal.
+         public bool hexProgressBufferIsDirty = true;
+         public bool hexBufferIsDirty = true;
+         public bool shellBufferIsDirty = true;
+@@ -71,6 +74,11 @@ namespace SphereOpt
+         public Material Material { get; private set; }
+ 
+         private readonly PoolCompaction allocations = new PoolCompaction();
++        // Serializes supported layer methods against sync and teardown. Public
++        // array/list/cursor/flag writes and game-owned input arrays remain caller-owned.
++        private readonly object syncRoot = new object();
++        private DirtyRange progressDirty;
++        private DirtyRange shellDirty;
+         private bool isFreed;
+         private static readonly int Stencil = Shader.PropertyToID("_Stencil");
+         private static readonly int Radius = Shader.PropertyToID("_Radius");
+@@ -111,36 +119,41 @@ namespace SphereOpt
+ 
+         public void Free()
+         {
+-            if (isFreed) return;
+-            isFreed = true;
+-            var buffers = new[] { polygonBuffer, hexProgressBuffer, shellBuffer, hexBuffer };
+-            polygonBuffer = null;
+-            hexProgressBuffer = null;
+-            shellBuffer = null;
+-            hexBuffer = null;
+-            var material = Material;
+-            Material = null;
+-            polygonPool = null;
+-            hexProgressPool = null;
+-            shellPool = null;
+-            hexPool?.Clear();
+-            hexPool = null;
+-            allocations.Clear();
+-            progressBaseCursor = 0;
+-            polygonCursor = 0;
+-            cachedHexCount = -1;
+-            props = null;
+-            layerId = 0;
+-
+-            Exception failure = null;
+-            foreach (var buffer in buffers)
++            lock (syncRoot)
+             {
+-                try { buffer?.Release(); }
++                if (isFreed) return;
++                isFreed = true;
++                var buffers = new[] { polygonBuffer, hexProgressBuffer, shellBuffer, hexBuffer };
++                polygonBuffer = null;
++                hexProgressBuffer = null;
++                shellBuffer = null;
++                hexBuffer = null;
++                var material = Material;
++                Material = null;
++                polygonPool = null;
++                hexProgressPool = null;
++                shellPool = null;
++                hexPool?.Clear();
++                hexPool = null;
++                allocations.Clear();
++                progressDirty.Clear();
++                shellDirty.Clear();
++                progressBaseCursor = 0;
++                polygonCursor = 0;
++                cachedHexCount = -1;
++                props = null;
++                layerId = 0;
++
++                Exception failure = null;
++                foreach (var buffer in buffers)
++                {
++                    try { buffer?.Release(); }
++                    catch (Exception exception) { if (failure == null) failure = exception; }
++                }
++                try { if (material != null) UnityEngine.Object.Destroy(material); }
+                 catch (Exception exception) { if (failure == null) failure = exception; }
++                if (failure != null) throw new InvalidOperationException("Failed to release shell layer resources.", failure);
+             }
+-            try { if (material != null) UnityEngine.Object.Destroy(material); }
+-            catch (Exception exception) { if (failure == null) failure = exception; }
+-            if (failure != null) throw new InvalidOperationException("Failed to release shell layer resources.", failure);
+         }
+ 
+         private void ThrowIfFreed()
+@@ -148,214 +161,308 @@ namespace SphereOpt
+             if (isFreed) throw new ObjectDisposedException(nameof(InstDysonShellLayer));
+         }
+ 
+-        private void ReplaceBuffer(ref ComputeBuffer buffer, int count, int stride, int property)
++        private ComputeBuffer ReplaceBuffer(ref ComputeBuffer buffer, int count, int stride, int property)
+         {
+             var replacement = new ComputeBuffer(count, stride);
+             try { props.SetBuffer(property, replacement); }
+             catch { replacement.Release(); throw; }
+             var previous = buffer;
+             buffer = replacement;
+-            previous?.Release();
++            // Caller commits the matching CPU pool/full-upload flag before
++            // releasing the old buffer, so a teardown exception remains retryable.
++            return previous;
+         }
+ 
+         public void SetCapacityPolygonPool(int nextCount)
+         {
+-            ThrowIfFreed();
+-            if (nextCount <= 0) throw new ArgumentOutOfRangeException(nameof(nextCount));
+-            var newCap = checked(polygonPool.Length + nextCount * 32);
+-            var destinationArray = new PolygonData[newCap];
+-
+-            if (polygonPool != null)
++            lock (syncRoot)
+             {
+-                Array.Copy(polygonPool, destinationArray, polygonPool.Length);
++                ThrowIfFreed();
++                if (nextCount <= 0) throw new ArgumentOutOfRangeException(nameof(nextCount));
++                var newCap = checked(polygonPool.Length + nextCount * 32);
++                var destinationArray = new PolygonData[newCap];
++
++                if (polygonPool != null)
++                {
++                    Array.Copy(polygonPool, destinationArray, polygonPool.Length);
++                }
++                var previous = ReplaceBuffer(ref polygonBuffer, newCap, POLYGONDATA_STRIDE, PolygonBuffer);
++                polygonPool = destinationArray;
++                polygonBufferIsDirty = true;
++                previous?.Release();
+             }
+-            ReplaceBuffer(ref polygonBuffer, newCap, POLYGONDATA_STRIDE, PolygonBuffer);
+-            polygonPool = destinationArray;
+-            polygonBufferIsDirty = true;
+         }
+ 
+-        public int AddPolygonData(List<VectorLF3> polygon, VectorLF3[] polyn, bool clockwise) {
+-            ThrowIfFreed();
+-            if (polygon == null) throw new ArgumentNullException(nameof(polygon));
+-            if (polyn == null || polyn.Length < polygon.Count) throw new ArgumentException("Missing polygon normals.", nameof(polyn));
+-            if (polygon.Count > polygonPool.Length - polygonCursor) SetCapacityPolygonPool(polygon.Count);
+-            for (var i = 0; i < polygon.Count; i++)
+-            { 
+-                polygonPool[polygonCursor + i].pos = polygon[i];
+-                polygonPool[polygonCursor + i].normal = polyn[i];
+-            }
++        public int AddPolygonData(List<VectorLF3> polygon, VectorLF3[] polyn, bool clockwise)
++        {
++            lock (syncRoot)
++            {
++                ThrowIfFreed();
++                if (polygon == null) throw new ArgumentNullException(nameof(polygon));
++                if (polyn == null || polyn.Length < polygon.Count) throw new ArgumentException("Missing polygon normals.", nameof(polyn));
++                if (polygon.Count > polygonPool.Length - polygonCursor) SetCapacityPolygonPool(polygon.Count);
++                for (var i = 0; i < polygon.Count; i++)
++                {
++                    polygonPool[polygonCursor + i].pos = polygon[i];
++                    polygonPool[polygonCursor + i].normal = polyn[i];
++                }
+ 
+-            polygonBufferIsDirty = true;
++                polygonBufferIsDirty = true;
+ 
+-            var polyIndex = polygonCursor;
+-            polygonCursor += polygon.Count;
+-            return polyIndex;
++                var polyIndex = polygonCursor;
++                polygonCursor += polygon.Count;
++                return polyIndex;
++            }
+         }
+ 
+         public void SetCapacityShellPool(int newCap)
+         {
+-            ThrowIfFreed();
+-            if (newCap <= 0) throw new ArgumentOutOfRangeException(nameof(newCap));
+-            if (newCap <= shellPool.Length) return;
+-            var destinationArray = new ShellData[newCap];
+-            if (shellPool != null)
++            lock (syncRoot)
+             {
+-                Array.Copy(shellPool, destinationArray, shellPool.Length);
++                ThrowIfFreed();
++                if (newCap <= 0) throw new ArgumentOutOfRangeException(nameof(newCap));
++                if (newCap <= shellPool.Length) return;
++                var destinationArray = new ShellData[newCap];
++                if (shellPool != null)
++                {
++                    Array.Copy(shellPool, destinationArray, shellPool.Length);
++                }
++                var previous = ReplaceBuffer(ref shellBuffer, newCap, SHELLDATA_STRIDE, ShellBuffer);
++                shellPool = destinationArray;
++                shellBufferIsDirty = true;
++                previous?.Release();
+             }
+-            ReplaceBuffer(ref shellBuffer, newCap, SHELLDATA_STRIDE, ShellBuffer);
+-            shellPool = destinationArray;
+-            shellBufferIsDirty = true;
+         }
+ 
+         public void AddShellData(int shellId, ShellData shellData)
+         {
+-            ThrowIfFreed();
+-            if (shellId < 0) throw new ArgumentOutOfRangeException(nameof(shellId));
+-            if (allocations.TryGet(shellId, out var existing))
++            lock (syncRoot)
+             {
+-                shellData.progressBaseIndex = existing.ProgressIndex;
+-                shellData.polygonIndex = existing.PolygonIndex;
+-                shellData.polyCount = existing.PolygonCount;
++                ThrowIfFreed();
++                if (shellId < 0) throw new ArgumentOutOfRangeException(nameof(shellId));
++                if (allocations.TryGet(shellId, out var existing))
++                {
++                    shellData.progressBaseIndex = existing.ProgressIndex;
++                    shellData.polygonIndex = existing.PolygonIndex;
++                    shellData.polyCount = existing.PolygonCount;
++                }
++                if (shellData.progressBaseIndex < 0 || shellData.progressBaseIndex > progressBaseCursor)
++                    throw new ArgumentOutOfRangeException(nameof(shellData));
++                if (shellId >= shellPool.Length) SetCapacityShellPool(shellId + 16);
++                if (progressBaseCursor > hexProgressPool.Length) SetCapacityHexProgressPool(checked(progressBaseCursor + 128));
++                // Legacy append callers reserve progressBaseCursor before AddShellData.
++                allocations.Register(shellId, shellData.progressBaseIndex, progressBaseCursor - shellData.progressBaseIndex,
++                    shellData.polygonIndex, shellData.polyCount);
++                shellPool[shellId] = shellData;
++                shellBufferIsDirty = true;
+             }
+-            if (shellData.progressBaseIndex < 0 || shellData.progressBaseIndex > progressBaseCursor)
+-                throw new ArgumentOutOfRangeException(nameof(shellData));
+-            if (shellId >= shellPool.Length) SetCapacityShellPool(shellId + 16);
+-            if (progressBaseCursor > hexProgressPool.Length) SetCapacityHexProgressPool(checked(progressBaseCursor + 128));
+-            // Legacy append callers reserve progressBaseCursor before AddShellData.
+-            allocations.Register(shellId, shellData.progressBaseIndex, progressBaseCursor - shellData.progressBaseIndex,
+-                shellData.polygonIndex, shellData.polyCount);
+-            shellPool[shellId] = shellData;
+-            shellBufferIsDirty = true;
+         }
+ 
+         // Call immediately after AddShellData with the number of reserved node progress entries.
+         public void RegisterProgressCount(int shellId, int count)
+         {
+-            if (isFreed) return;
+-            if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
+-            if (!allocations.TryGet(shellId, out var allocation)) return;
+-            if (count > progressBaseCursor - allocation.ProgressIndex) throw new ArgumentOutOfRangeException(nameof(count));
+-            allocations.RegisterProgressCount(shellId, count);
++            lock (syncRoot)
++            {
++                if (isFreed) return;
++                if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
++                if (!allocations.TryGet(shellId, out var allocation)) return;
++                if (count > progressBaseCursor - allocation.ProgressIndex) throw new ArgumentOutOfRangeException(nameof(count));
++                allocations.RegisterProgressCount(shellId, count);
++            }
+         }
+ 
+         public void SetCapacityHexProgressPool(int newCap)
+         {
+-            ThrowIfFreed();
+-            if (newCap <= 0) throw new ArgumentOutOfRangeException(nameof(newCap));
+-            if (newCap <= hexProgressPool.Length) return;
+-            var destinationArray = new HexProgressData[newCap];
+-            if (hexProgressPool != null)
++            lock (syncRoot)
+             {
+-                Array.Copy(hexProgressPool, destinationArray, hexProgressPool.Length);
++                ThrowIfFreed();
++                if (newCap <= 0) throw new ArgumentOutOfRangeException(nameof(newCap));
++                if (newCap <= hexProgressPool.Length) return;
++                var destinationArray = new HexProgressData[newCap];
++                if (hexProgressPool != null)
++                {
++                    Array.Copy(hexProgressPool, destinationArray, hexProgressPool.Length);
++                }
++                var previous = ReplaceBuffer(ref hexProgressBuffer, newCap, HEXPROGRESSDATA_STRIDE, HexProgressBuffer);
++                hexProgressPool = destinationArray;
++                hexProgressBufferIsDirty = true;
++                previous?.Release();
+             }
+-            ReplaceBuffer(ref hexProgressBuffer, newCap, HEXPROGRESSDATA_STRIDE, HexProgressBuffer);
+-            hexProgressPool = destinationArray;
+-            hexProgressBufferIsDirty = true;
+         }
+ 
+         public void AddHexProgressData(int hexProgressIndex, HexProgressData hexProgressData)
+         {
+-            ThrowIfFreed();
+-            if (hexProgressIndex < 0) throw new ArgumentOutOfRangeException(nameof(hexProgressIndex));
+-            if (hexProgressIndex >= hexProgressPool.Length) SetCapacityHexProgressPool(hexProgressIndex + 128);
+-            hexProgressPool[hexProgressIndex] = hexProgressData;
+-            hexProgressBufferIsDirty = true;
++            lock (syncRoot)
++            {
++                ThrowIfFreed();
++                if (hexProgressIndex < 0) throw new ArgumentOutOfRangeException(nameof(hexProgressIndex));
++                if (hexProgressIndex >= hexProgressPool.Length) SetCapacityHexProgressPool(hexProgressIndex + 128);
++                hexProgressPool[hexProgressIndex] = hexProgressData;
++                hexProgressBufferIsDirty = true;
++            }
+         }
+ 
+         public void UpdateHexProgress(int shellIndex, int nodeIndex, float progress)
+         {
+-            if (isFreed || !allocations.TryGet(shellIndex, out var allocation) || nodeIndex < 0 || nodeIndex >= allocation.ProgressCount) return;
+-            if (hexProgressPool[allocation.ProgressIndex + nodeIndex].progress == progress) return;
+-            hexProgressPool[allocation.ProgressIndex + nodeIndex].progress = progress;
+-            hexProgressBufferIsDirty = true;
++            lock (syncRoot)
++            {
++                if (isFreed || !allocations.TryGet(shellIndex, out var allocation) || nodeIndex < 0 || nodeIndex >= allocation.ProgressCount) return;
++                UpdateProgressAt(allocation.ProgressIndex + nodeIndex, progress);
++            }
+         }
+ 
+-        public void SyncBufferData()
++        private void UpdateProgressAt(int index, float progress)
+         {
+-            if (isFreed) return;
+-            if (hexProgressBufferIsDirty)
+-            {
+-                hexProgressBuffer.SetData(hexProgressPool);
+-                hexProgressBufferIsDirty = false;
+-            }
++            if (hexProgressPool[index].progress == progress) return;
++            hexProgressPool[index].progress = progress;
++            progressDirty.Include(index);
++        }
+ 
+-            if (hexBufferIsDirty)
++        // Readiness is checked on every call; this does not cache game structure.
++        // A later invalid node may leave earlier precise writes pending, which is
++        // safe when the caller rejects the layer and retries readiness next frame.
++        internal bool TryReconcileShell(int shellId, int[] referencedNodes, int[] nodecps, int[] offsets,
++            int pointsPerVertex, Color32 color, uint state)
++        {
++            lock (syncRoot)
+             {
+-                if (hexPool.Count == 0)
++                if (isFreed || !allocations.TryGet(shellId, out var allocation) ||
++                    referencedNodes == null || nodecps == null || offsets == null) return false;
++                foreach (var node in referencedNodes)
+                 {
+-                    hexBuffer?.Release();
+-                    hexBuffer = null;
++                    // Subtraction avoids overflow for an invalid int.MaxValue node.
++                    if (node < 0 || node >= nodecps.Length - 1 || node >= offsets.Length - 1 ||
++                        node >= allocation.ProgressCount ||
++                        !ShellBatchPolicy.TryGetProgress(nodecps[node], offsets[node], offsets[node + 1],
++                            pointsPerVertex, out var progress)) return false;
++                    UpdateProgressAt(allocation.ProgressIndex + node, progress);
+                 }
+-                else
++                var packed = PackColor(color);
++                if (shellPool[shellId].color != packed || shellPool[shellId].state != state)
+                 {
+-                    if (hexBuffer == null || hexBuffer.count != hexPool.Count)
+-                        ReplaceBuffer(ref hexBuffer, hexPool.Count, HEXDATA_STRIDE, HexBuffer);
+-                    hexBuffer.SetData(hexPool);
++                    shellPool[shellId].color = packed;
++                    shellPool[shellId].state = state;
++                    shellDirty.Include(shellId);
+                 }
+-                hexBufferIsDirty = false;
++                return true;
+             }
++        }
+ 
+-            if (shellBufferIsDirty)
+-            {
+-                shellBuffer.SetData(shellPool);
+-                shellBufferIsDirty = false;
+-            }
++        private static void SyncTrackedBuffer<T>(ComputeBuffer buffer, T[] pool, ref bool forceFull, ref DirtyRange dirty)
++        {
++            if (forceFull) buffer.SetData(pool);
++            else if (dirty.IsDirty) buffer.SetData(pool, dirty.Start, dirty.Start, dirty.Count);
++            else return;
++            // Neither the public signal nor the span is consumed by a failed upload.
++            forceFull = false;
++            dirty.Clear();
++        }
+ 
+-            if (polygonBufferIsDirty)
++        public void SyncBufferData()
++        {
++            lock (syncRoot)
+             {
+-                polygonBuffer.SetData(polygonPool);
+-                polygonBufferIsDirty = false;
++                if (isFreed) return;
++                SyncTrackedBuffer(hexProgressBuffer, hexProgressPool, ref hexProgressBufferIsDirty, ref progressDirty);
++
++                if (hexBufferIsDirty)
++                {
++                    if (hexPool.Count == 0)
++                    {
++                        hexBuffer?.Release();
++                        hexBuffer = null;
++                    }
++                    else
++                    {
++                        if (hexBuffer == null || hexBuffer.count != hexPool.Count)
++                            ReplaceBuffer(ref hexBuffer, hexPool.Count, HEXDATA_STRIDE, HexBuffer)?.Release();
++                        hexBuffer.SetData(hexPool);
++                    }
++                    hexBufferIsDirty = false;
++                }
++
++                SyncTrackedBuffer(shellBuffer, shellPool, ref shellBufferIsDirty, ref shellDirty);
++
++                if (polygonBufferIsDirty)
++                {
++                    polygonBuffer.SetData(polygonPool);
++                    polygonBufferIsDirty = false;
++                }
+             }
+         }
+ 
+         public void SetProps()
+         {
+-            if (isFreed) return;
+-            props.SetFloat(Radius, radius);
+-            props.SetFloat(Scale, gridScale);
+-            props.SetFloat(GridSize, gridSize);
+-            props.SetFloat(CellSize, 0.94f);
+-            props.SetFloat(LayerId, layerId);
+-            if (hexBuffer != null) props.SetBuffer(HexBuffer, hexBuffer);
+-            props.SetBuffer(HexProgressBuffer, hexProgressBuffer);
+-            props.SetBuffer(ShellBuffer, shellBuffer);
+-            props.SetBuffer(PolygonBuffer, polygonBuffer);
++            lock (syncRoot)
++            {
++                if (isFreed) return;
++                props.SetFloat(Radius, radius);
++                props.SetFloat(Scale, gridScale);
++                props.SetFloat(GridSize, gridSize);
++                props.SetFloat(CellSize, 0.94f);
++                props.SetFloat(LayerId, layerId);
++                if (hexBuffer != null) props.SetBuffer(HexBuffer, hexBuffer);
++                props.SetBuffer(HexProgressBuffer, hexProgressBuffer);
++                props.SetBuffer(ShellBuffer, shellBuffer);
++                props.SetBuffer(PolygonBuffer, polygonBuffer);
++            }
+         }
+ 
+         public void RemoveDysonShell(int shellId)
+         {
+-            if (isFreed || !allocations.TryGet(shellId, out _)) return;
+-            var removed = allocations.Remove(shellId, hexProgressPool, ref progressBaseCursor, polygonPool, ref polygonCursor);
+-            var removedHexes = hexPool.RemoveAll(x => x.shellIndex == shellId);
+-            if (!removed && removedHexes == 0) return;
+-
+-            hexBufferIsDirty = true;
+-            hexProgressBufferIsDirty = true;
+-            foreach (var entry in allocations.Allocations)
++            lock (syncRoot)
+             {
+-                shellPool[entry.Key].progressBaseIndex = entry.Value.ProgressIndex;
+-                shellPool[entry.Key].polygonIndex = entry.Value.PolygonIndex;
++                if (isFreed || !allocations.TryGet(shellId, out _)) return;
++                var removed = allocations.Remove(shellId, hexProgressPool, ref progressBaseCursor, polygonPool, ref polygonCursor);
++                var removedHexes = hexPool.RemoveAll(x => x.shellIndex == shellId);
++                if (!removed && removedHexes == 0) return;
++
++                hexBufferIsDirty = true;
++                hexProgressBufferIsDirty = true;
++                foreach (var entry in allocations.Allocations)
++                {
++                    shellPool[entry.Key].progressBaseIndex = entry.Value.ProgressIndex;
++                    shellPool[entry.Key].polygonIndex = entry.Value.PolygonIndex;
++                }
++                polygonBufferIsDirty = true;
++                if (shellId >= 0 && shellId < shellPool.Length) shellPool[shellId] = default(ShellData);
++                shellBufferIsDirty = true;
+             }
+-            polygonBufferIsDirty = true;
+-            if (shellId >= 0 && shellId < shellPool.Length) shellPool[shellId] = default(ShellData);
+-            shellBufferIsDirty = true;
+         }
+ 
+         public void UpdateState(int shellId, uint shellState)
+         {
+-            if (isFreed || !allocations.TryGet(shellId, out _)) return;
+-            if (shellPool[shellId].state == shellState) return;
+-            shellPool[shellId].state = shellState;
+-            shellBufferIsDirty = true;
++            lock (syncRoot)
++            {
++                if (isFreed || !allocations.TryGet(shellId, out _)) return;
++                if (shellPool[shellId].state == shellState) return;
++                shellPool[shellId].state = shellState;
++                shellDirty.Include(shellId);
++            }
+         }
+ 
+         public void UpdateColor(int shellId, Color32 shellColor)
+         {
+-            if (isFreed || !allocations.TryGet(shellId, out _)) return;
+-            var packed = (shellColor.a << 24) | (shellColor.b << 16) | (shellColor.g << 8) | shellColor.r;
+-            if (shellPool[shellId].color == packed) return;
+-            shellPool[shellId].color = packed;
+-            shellBufferIsDirty = true;
++            lock (syncRoot)
++            {
++                if (isFreed || !allocations.TryGet(shellId, out _)) return;
++                var packed = PackColor(shellColor);
++                if (shellPool[shellId].color == packed) return;
++                shellPool[shellId].color = packed;
++                shellDirty.Include(shellId);
++            }
++        }
++
++        private static int PackColor(Color32 color) => (color.a << 24) | (color.b << 16) | (color.g << 8) | color.r;
++
++        public void UpdateStyle(int shellId, int style)
++        {
++            lock (syncRoot)
++            {
++                if (isFreed || !allocations.TryGet(shellId, out _) || shellPool[shellId].protoId == style) return;
++                shellPool[shellId].protoId = style;
++                shellDirty.Include(shellId);
++            }
+         }
+     }
+ }
+diff --git a/InstDysonShellRenderer.cs b/InstDysonShellRenderer.cs
+index 661ee93085f7d784ebab2f3aff550fc139d34c44..45f62dbff6100cadd42cab64b1ea239db291eb5f 100644
+--- a/InstDysonShellRenderer.cs
++++ b/InstDysonShellRenderer.cs
+@@ -102,16 +102,10 @@ namespace SphereOpt
+                 Vector3 center = GameAccess.ShellCenter(shell);
+                 if (known.Center != center) return false;
+                 if (!ShellBatchPolicy.HasValidCenter(center.x, center.y, center.z)) return false;
+-                foreach (var node in known.ReferencedNodes)
+-                {
+-                    if (node < 0 || node + 1 >= shell.nodecps.Length || node + 1 >= shell.vertsqOffset.Length ||
+-                        !ShellBatchPolicy.HasValidProgress(shell.nodecps[node], shell.vertsqOffset[node],
+-                            shell.vertsqOffset[node + 1], shell.cpPerVertex, 1f)) return false;
+-                    cache.UpdateHexProgress(shell.id, node, ShellBatchPolicy.GetProgress(shell.nodecps[node],
+-                        shell.vertsqOffset[node], shell.vertsqOffset[node + 1], shell.cpPerVertex));
+-                }
+-                cache.UpdateColor(shell.id, shell.color);
+-                cache.UpdateState(shell.id, shell.state);
++                // Resolve pool ownership once for this shell, and validate and
++                // calculate each referenced node's progress in the same pass.
++                if (!cache.TryReconcileShell(shell.id, known.ReferencedNodes, shell.nodecps,
++                    shell.vertsqOffset, shell.cpPerVertex, shell.color, shell.state)) return false;
+                 hexCount += shell.verts.Length;
+             }
+             return hexCount > 0 && hexCount == cache.hexPool.Count;
+diff --git a/Patch_DysonShell.cs b/Patch_DysonShell.cs
+index 11f9735143baee09407945225dbd01f333127c66..0096c0102255d71230216a60b89e2decd6972d25 100644
+--- a/Patch_DysonShell.cs
++++ b/Patch_DysonShell.cs
+@@ -76,8 +76,7 @@ namespace SphereOpt
+             if (!SphereOpt.Active || !SphereOpt.TryGetRenderer(__instance.dysonSphere, out var renderer)) return;
+             var layer = renderer.getInstShellLayer(__instance.layerId);
+             if (layer?.shellPool == null || __instance.id < 1 || __instance.id >= layer.shellPool.Length) return;
+-            layer.shellPool[__instance.id].protoId = EffectiveStyle(__instance.protoId);
+-            layer.shellBufferIsDirty = true;
++            layer.UpdateStyle(__instance.id, EffectiveStyle(__instance.protoId));
+         }
+ 
+         [HarmonyPatch(typeof(DysonShell), "Construct")]
+@@ -130,6 +129,9 @@ namespace SphereOpt
+ 
+         [HarmonyTranspiler]
+         [HarmonyPatch(typeof(UIDysonBrush_Paint), "_OnUpdate")]
++        // DSPOptimizations must still see the original color store and its
++        // receiver before our semantic replacement consumes that store.
++        [HarmonyAfter("com.Selsion.DSPOptimizations")]
+         private static IEnumerable<CodeInstruction> UIDysonBrush_Paint__OnUpdate(IEnumerable<CodeInstruction> instructions)
+         {
+             return ColorStoreRewriter.Replace(instructions,
+diff --git a/Patch_DysonSphereSegmentRenderer.cs b/Patch_DysonSphereSegmentRenderer.cs
+index d38c1c2390b53f9a03b41710c6a18a383664d23b..cdcb991edbab736fec46e4e0d7b18468e16e4d79 100644
+--- a/Patch_DysonSphereSegmentRenderer.cs
++++ b/Patch_DysonSphereSegmentRenderer.cs
+@@ -7,13 +7,49 @@ namespace SphereOpt
+     public static class Patch_DysonSphereSegmentRenderer
+     {
+         [ThreadStatic] private static DrawContext current;
++        [ThreadStatic] private static DrawData available;
+ 
+         private sealed class DrawContext
+         {
+             internal DrawContext Previous;
++            internal DrawData Data;
++            internal bool Released;
++        }
++
++        // Retain the array and callback up to each thread's peak nesting depth.
++        // The per-call context stays unique, so an old finalizer state cannot
++        // retire a later draw that has borrowed the same data.
++        private sealed class DrawData
++        {
++            internal DrawData Next;
+             internal DysonSphere Sphere;
+             internal int Mask;
+             internal readonly DysonSphereLayer[] Layers = new DysonSphereLayer[11];
++            internal readonly Action<int> Submitted;
++
++            internal DrawData() { Submitted = RecordSubmission; }
++
++            private void RecordSubmission(int id)
++            {
++                Layers[id] = Sphere.layersIdBased[id];
++                Mask |= 1 << id;
++            }
++
++            internal void Reset()
++            {
++                Sphere = null;
++                Mask = 0;
++                Array.Clear(Layers, 0, Layers.Length);
++            }
++        }
++
++        private static DrawData BorrowData()
++        {
++            var data = available;
++            if (data == null) return new DrawData();
++            available = data.Next;
++            data.Next = null;
++            return data;
+         }
+ 
+         [HarmonyPatch(typeof(DysonSphereSegmentRenderer), "FreeStatic")]
+@@ -38,12 +74,10 @@ namespace SphereOpt
+                 var renderer = SphereOpt.getInstDysonShellRendererForSphere(sphere);
+                 var mask = renderer.PrepareFrame(place, editorMask, gameMask);
+                 if (mask == 0) return true;
+-                context.Sphere = sphere;
+-                renderer.RenderShells(place, editorMask, gameMask, id =>
+-                {
+-                    context.Layers[id] = sphere.layersIdBased[id];
+-                    context.Mask |= 1 << id;
+-                });
++                var data = BorrowData();
++                context.Data = data;
++                data.Sphere = sphere;
++                renderer.RenderShells(place, editorMask, gameMask, data.Submitted);
+             }
+             catch (Exception exception) { SphereOpt.Disable(exception); }
+             // Original node/frame instancing and painting overlays always run.
+@@ -52,9 +86,10 @@ namespace SphereOpt
+ 
+         internal static int RenderShellCursor(DysonSphereLayer layer)
+         {
+-            return current != null && layer.id > 0 && layer.id <= 10 && ReferenceEquals(current.Layers[layer.id], layer) &&
+-                ReferenceEquals(current.Sphere, layer.dysonSphere) &&
+-                (current.Mask & (1 << layer.id)) != 0 ? 1 : layer.shellCursor;
++            var data = current?.Data;
++            return data != null && layer.id > 0 && layer.id <= 10 && ReferenceEquals(data.Layers[layer.id], layer) &&
++                ReferenceEquals(data.Sphere, layer.dysonSphere) &&
++                (data.Mask & (1 << layer.id)) != 0 ? 1 : layer.shellCursor;
+         }
+ 
+         [HarmonyPatch(typeof(DysonSphereSegmentRenderer), "DrawModels")]
+@@ -70,7 +105,16 @@ namespace SphereOpt
+         [HarmonyFinalizer]
+         private static void AfterDraw(object __state)
+         {
+-            if (__state is DrawContext context) current = context.Previous;
++            if (!(__state is DrawContext context) || context.Released || !ReferenceEquals(current, context)) return;
++            current = context.Previous;
++            context.Previous = null;
++            context.Released = true;
++            var data = context.Data;
++            context.Data = null;
++            if (data == null) return;
++            data.Reset();
++            data.Next = available;
++            available = data;
+         }
+     }
+ }
+diff --git a/ShellBatchPolicy.cs b/ShellBatchPolicy.cs
+index f0737692a2dfca9ffd29daec15f709dd3c9c1bea..d44a34e7b2589386aa533df5c5cd561005c9284d 100644
+--- a/ShellBatchPolicy.cs
++++ b/ShellBatchPolicy.cs
+@@ -14,16 +14,23 @@ namespace SphereOpt
+ 
+         internal static bool HasValidProgress(int points, int start, int end, int pointsPerVertex, float fillOrder)
+         {
+-            if (points < 0 || start < 0 || end <= start || pointsPerVertex <= 0 || float.IsNaN(fillOrder) ||
+-                float.IsInfinity(fillOrder) || fillOrder < 0 || fillOrder > 1) return false;
+-            return true;
++            return !float.IsNaN(fillOrder) && !float.IsInfinity(fillOrder) && fillOrder >= 0 && fillOrder <= 1 &&
++                TryGetProgress(points, start, end, pointsPerVertex, out _);
+         }
+ 
+         internal static float GetProgress(int points, int start, int end, int pointsPerVertex)
+         {
+-            if (!HasValidProgress(points, start, end, pointsPerVertex, 1f)) return 0f;
++            TryGetProgress(points, start, end, pointsPerVertex, out var progress);
++            return progress;
++        }
++
++        internal static bool TryGetProgress(int points, int start, int end, int pointsPerVertex, out float progress)
++        {
++            progress = 0f;
++            if (points < 0 || start < 0 || end <= start || pointsPerVertex <= 0) return false;
+             var capacity = ((long)end - start) * pointsPerVertex;
+-            return points >= capacity ? 1f : (float)(points / (double)capacity);
++            progress = points >= capacity ? 1f : (float)(points / (double)capacity);
++            return true;
+         }
+     }
+ }
+diff --git a/tests/SphereOpt.LayerTests/LayerTests.cs b/tests/SphereOpt.LayerTests/LayerTests.cs
+index 52eb5edf6d896214ccaf735ebb6665d6c4a93881..36ad5bbfb350d14d501859852dce6504d6276466 100644
+--- a/tests/SphereOpt.LayerTests/LayerTests.cs
++++ b/tests/SphereOpt.LayerTests/LayerTests.cs
+@@ -3,10 +3,12 @@ using Layer = SphereOpt.InstDysonShellLayer;
+ 
+ namespace SphereOpt.LayerTests;
+ 
+-internal static class LayerTests
++internal static partial class LayerTests
+ {
+     internal static IEnumerable<(string Name, Action Run)> Cases()
+     {
++        foreach (var test in PartialUploadCases()) yield return test;
++        foreach (var test in ReconcileCases()) yield return test;
+         yield return ("Material/per-layer stencil and shared-template ownership", Stencil);
+         yield return ("Free/repeated teardown and post-free callbacks", IdempotentFree);
+         foreach (var operation in new[] { "MaterialPropertyBlock.ctor", "Material.ctor", "Material.SetInt" })
+@@ -440,15 +442,25 @@ internal static class LayerTests
+             polygons.Select(value => new VectorLF3(value.normal.x, value.normal.y, value.normal.z)).ToArray(), false);
+         layer.AddShellData(id, new Layer.ShellData
+         {
+-            progressBaseIndex = progressBase, polygonIndex = polygonBase, polyCount = polygonCount,
+-            color = seed, state = (uint)seed, protoId = seed % 7, center = new Vector3(seed, 1, 2), clockwise = 1
++            progressBaseIndex = progressBase,
++            polygonIndex = polygonBase,
++            polyCount = polygonCount,
++            color = seed,
++            state = (uint)seed,
++            protoId = seed % 7,
++            center = new Vector3(seed, 1, 2),
++            clockwise = 1
+         });
+         layer.RegisterProgressCount(id, progressCount);
+         for (var i = 0; i < progress.Length; i++) layer.AddHexProgressData(progressBase + i, progress[i]);
+         var hexes = Enumerable.Range(0, hexCount).Select(index => new Layer.HexData
+         {
+-            shellIndex = id, nodeIndex = index % progressCount, closestPolygon = index % polygonCount,
+-            pos = new Vector3(seed, index, -index), axialCoords_xy = (uint)(seed * 10 + index), vertFillOrder = seed + index * .5f
++            shellIndex = id,
++            nodeIndex = index % progressCount,
++            closestPolygon = index % polygonCount,
++            pos = new Vector3(seed, index, -index),
++            axialCoords_xy = (uint)(seed * 10 + index),
++            vertFillOrder = seed + index * .5f
+         }).ToArray();
+         layer.hexPool.AddRange(hexes);
+         layer.hexBufferIsDirty = true;
+diff --git a/tests/SphereOpt.LayerTests/PartialUploadTests.cs b/tests/SphereOpt.LayerTests/PartialUploadTests.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..29b4bee3bc4ca757a9830fe06da4bd04cf69e786
+--- /dev/null
++++ b/tests/SphereOpt.LayerTests/PartialUploadTests.cs
+@@ -0,0 +1,520 @@
++using UnityEngine;
++using Layer = SphereOpt.InstDysonShellLayer;
++
++namespace SphereOpt.LayerTests;
++
++internal static partial class LayerTests
++{
++    private static IEnumerable<(string Name, Action Run)> PartialUploadCases()
++    {
++        yield return ("Partial/progress one element and bounding merged span", ProgressRanges);
++        yield return ("Partial/sparse shell IDs merge appearance into one bounding span", AppearanceRanges);
++        yield return ("Partial/public force-full flags remain independent of tracked writes", ForceFullWithRanges);
++        yield return ("Partial/public full replacement uploads untracked entries beyond pending span", PublicPoolReplacement);
++        yield return ("Partial/styles unchanged and missing IDs are no-ops", Styles);
++        yield return ("Partial/constructor, append and replacement require full initialization", FullInitialization);
++        yield return ("Partial/growth and compaction supersede pending precise spans", FullStructuralChanges);
++        foreach (var occurrence in new[] { 1, 2 })
++        {
++            var captured = occurrence;
++            yield return ($"Partial/upload failure #{occurrence} retains and extends span for retry", () => PartialFailure(captured));
++        }
++        yield return ("Partial/force-full failure retains flag and range through retry", FullFailureWithRanges);
++        yield return ("Partial/failed growth preserves precise span", GrowthFailureWithRange);
++        yield return ("Partial/error after simulated copy retains span for retry", FailureAfterCopy);
++        foreach (var kind in new[] { "progress", "shell", "polygon", "hex" })
++        {
++            var captured = kind;
++            yield return ($"Replacement/{kind} old-release failure keeps new ownership and full retry", () => ReleaseFailureAfterReplacement(captured));
++        }
++        yield return ("Free/release failure still cleans every resource exactly once", CleanupFailure);
++        yield return ("Partial/seeded writes match independent full-buffer snapshots", PartialModel);
++        yield return ("Partial/algorithmic representative submission and byte counts", AlgorithmicCounts);
++        foreach (var operation in new[] { "updates", "reconcile", "remove", "grow", "replace", "free" })
++        {
++            var captured = operation;
++            yield return ($"Concurrency/paused upload serializes {operation} without lost invalidation", () => ConcurrentMutation(captured));
++        }
++    }
++
++    private static ComputeBuffer ProgressBuffer(Layer layer) => layer.props.Buffer("_HexProgressBuffer");
++    private static ComputeBuffer AppearanceBuffer(Layer layer) => layer.props.Buffer("_ShellBuffer");
++    private static void ExpectUpload(ComputeBuffer buffer, int source, int count, bool full = false)
++        => Check.Equal(new ComputeBuffer.UploadRecord(source, source, count, full), buffer.Uploads.Last(), "Upload span/full mode.");
++
++    private static void ProgressRanges()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 7, 5, 3, 5, 70);
++        layer.SyncBufferData();
++        var buffer = ProgressBuffer(layer);
++        var bytes = buffer.UploadedBytes;
++        layer.UpdateHexProgress(7, 3, .75f);
++        Check.True(!layer.hexProgressBufferIsDirty, "Tracked progress set the public force-full flag.");
++        layer.SyncBufferData();
++        ExpectUpload(buffer, 3, 1);
++        Check.Equal(4L, buffer.UploadedBytes - bytes);
++        VerifyUploads(layer);
++        layer.UpdateHexProgress(7, 4, .5f);
++        layer.UpdateHexProgress(7, 1, .25f);
++        layer.UpdateHexProgress(7, 2, .125f);
++        var calls = buffer.UploadCalls;
++        layer.SyncBufferData();
++        Check.Equal(calls + 1, buffer.UploadCalls, "Merged writes submitted more than once.");
++        ExpectUpload(buffer, 1, 4);
++        VerifyUploads(layer);
++        calls = buffer.UploadCalls;
++        layer.SyncBufferData();
++        Check.Equal(calls, buffer.UploadCalls, "Clean span repeated an upload.");
++    }
++
++    private static void AppearanceRanges()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 2, 3, 2, 20);
++        Add(layer, 70, 2, 3, 2, 70);
++        Add(layer, 9, 2, 3, 2, 90);
++        layer.SyncBufferData();
++        var buffer = AppearanceBuffer(layer);
++        var bytes = buffer.UploadedBytes;
++        layer.UpdateColor(70, new Color32(1, 2, 3, 4));
++        layer.UpdateState(70, 123);
++        Check.True(!layer.shellBufferIsDirty, "Tracked appearance set the public force-full flag.");
++        layer.SyncBufferData();
++        ExpectUpload(buffer, 70, 1);
++        Check.Equal(40L, buffer.UploadedBytes - bytes);
++        VerifyUploads(layer);
++        layer.UpdateState(2, 999);
++        layer.UpdateColor(70, new Color32(9, 8, 7, 6));
++        var calls = buffer.UploadCalls;
++        layer.SyncBufferData();
++        ExpectUpload(buffer, 2, 69);
++        Check.Equal(calls + 1, buffer.UploadCalls);
++        VerifyUploads(layer);
++    }
++
++    private static void ForceFullWithRanges()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 4, 3, 2, 20);
++        layer.SyncBufferData();
++        foreach (var flagFirst in new[] { false, true })
++        {
++            if (flagFirst) layer.hexProgressBufferIsDirty = layer.shellBufferIsDirty = true;
++            layer.UpdateHexProgress(2, 1, flagFirst ? .1f : .2f);
++            layer.UpdateState(2, flagFirst ? 1u : 2u);
++            // Direct writes require the documented public full-upload signal.
++            layer.hexProgressPool[50].progress = 123;
++            layer.shellPool[8].protoId = 6;
++            if (!flagFirst) layer.hexProgressBufferIsDirty = layer.shellBufferIsDirty = true;
++            layer.SyncBufferData();
++            ExpectUpload(ProgressBuffer(layer), 0, layer.hexProgressPool.Length, true);
++            ExpectUpload(AppearanceBuffer(layer), 0, layer.shellPool.Length, true);
++            VerifyUploads(layer);
++        }
++        var events = Gpu.Events.Count;
++        layer.SyncBufferData();
++        Check.Equal(events, Gpu.Events.Count, "Full upload retained stale precise ranges.");
++    }
++
++    private static void Styles()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 70, 2, 3, 2, 70);
++        layer.SyncBufferData();
++        var events = Gpu.Events.Count;
++        layer.UpdateStyle(70, layer.shellPool[70].protoId);
++        foreach (var missing in new[] { -1, 0, 2, int.MaxValue }) layer.UpdateStyle(missing, 6);
++        layer.SyncBufferData();
++        Check.Equal(events, Gpu.Events.Count, "No-op style submitted data.");
++        layer.UpdateStyle(70, 6);
++        layer.SyncBufferData();
++        ExpectUpload(AppearanceBuffer(layer), 70, 1);
++        Check.Equal(6, AppearanceBuffer(layer).Data<Layer.ShellData>()[70].protoId);
++        VerifyUploads(layer);
++        layer.RemoveDysonShell(70);
++        layer.SyncBufferData();
++        events = Gpu.Events.Count;
++        layer.UpdateStyle(70, 4);
++        layer.SyncBufferData();
++        Check.Equal(events, Gpu.Events.Count, "Removed style submitted data.");
++        layer.Free();
++        layer.UpdateStyle(70, 1);
++    }
++
++    private static void PublicPoolReplacement()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        layer.UpdateHexProgress(2, 1, .5f);
++        layer.UpdateState(2, 123);
++        layer.hexProgressPool = layer.hexProgressPool.ToArray();
++        layer.shellPool = layer.shellPool.ToArray();
++        layer.hexProgressPool[60].progress = .75f;
++        layer.shellPool[10].protoId = 5;
++        layer.hexProgressBufferIsDirty = true;
++        layer.shellBufferIsDirty = true;
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 64, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 11, true);
++        VerifyUploads(layer);
++    }
++
++    private static void FullInitialization()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 64, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 11, true);
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 64, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 11, true);
++        var replacement = layer.shellPool[2];
++        replacement.protoId = 5;
++        layer.UpdateState(2, 99);
++        layer.AddShellData(2, replacement);
++        layer.SyncBufferData();
++        ExpectUpload(AppearanceBuffer(layer), 0, 11, true);
++        Check.Equal(5, layer.shellPool[2].protoId);
++        layer.AddHexProgressData(1, new Layer.HexProgressData { progress = .5f });
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 64, true);
++        VerifyUploads(layer);
++    }
++
++    private static void FullStructuralChanges()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 7, 2, 3, 2, 70);
++        Add(layer, 2, 3, 4, 2, 20);
++        Add(layer, 90, 2, 3, 2, 90);
++        layer.SyncBufferData();
++        layer.UpdateHexProgress(90, 1, .25f);
++        layer.UpdateStyle(90, 6);
++        layer.SetCapacityHexProgressPool(200);
++        layer.SetCapacityShellPool(140);
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 200, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 140, true);
++        VerifyUploads(layer);
++        // The old precise index 6 becomes index 3 when the middle shell is removed.
++        layer.UpdateHexProgress(90, 1, .75f);
++        layer.UpdateState(90, 555);
++        layer.RemoveDysonShell(2);
++        layer.SyncBufferData();
++        Check.Equal(.75f, layer.hexProgressPool[3].progress);
++        ExpectUpload(ProgressBuffer(layer), 0, 200, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 140, true);
++        VerifyUploads(layer);
++        layer.RemoveDysonShell(7);
++        layer.RemoveDysonShell(90);
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 200, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 140, true);
++        Check.True(ProgressBuffer(layer).Data<Layer.HexProgressData>().All(value => value.progress == 0), "Dead GPU tail survived complete compaction.");
++        VerifyUploads(layer);
++        Add(layer, 2, 4, 3, 2, 120);
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 200, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 140, true);
++        layer.UpdateHexProgress(2, 3, .5f);
++        layer.UpdateStyle(2, 4);
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 3, 1);
++        ExpectUpload(AppearanceBuffer(layer), 2, 1);
++        VerifyUploads(layer);
++    }
++
++    private static void PartialFailure(int occurrence)
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 5, 3, 2, 20);
++        Add(layer, 9, 3, 3, 2, 90);
++        layer.SyncBufferData();
++        var progress = ProgressBuffer(layer);
++        var shell = AppearanceBuffer(layer);
++        var progressCalls = progress.UploadCalls;
++        layer.UpdateHexProgress(2, 3, .5f);
++        layer.UpdateStyle(9, 5);
++        var failure = Gpu.Fail("ComputeBuffer.SetData", occurrence);
++        Check.Same(failure, Check.Throws<InjectedFailure>(layer.SyncBufferData), "Partial upload replaced error.");
++        Check.Equal(progressCalls + (occurrence == 2 ? 1 : 0), progress.UploadCalls);
++        layer.UpdateHexProgress(2, 1, .25f);
++        layer.UpdateStyle(2, 3);
++        layer.SyncBufferData();
++        ExpectUpload(progress, 1, occurrence == 1 ? 3 : 1);
++        ExpectUpload(shell, 2, 8);
++        VerifyUploads(layer);
++        var events = Gpu.Events.Count;
++        layer.SyncBufferData();
++        Check.Equal(events, Gpu.Events.Count, "Retry did not consume completed ranges.");
++    }
++
++    private static void FullFailureWithRanges()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        layer.UpdateHexProgress(2, 1, .5f);
++        layer.UpdateStyle(2, 4);
++        layer.hexProgressBufferIsDirty = layer.shellBufferIsDirty = true;
++        var failure = Gpu.Fail("ComputeBuffer.SetData");
++        Check.Same(failure, Check.Throws<InjectedFailure>(layer.SyncBufferData), "Full upload replaced error.");
++        Check.True(layer.hexProgressBufferIsDirty && layer.shellBufferIsDirty, "Failed full upload consumed signal.");
++        layer.UpdateHexProgress(2, 2, .75f);
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 64, true);
++        ExpectUpload(AppearanceBuffer(layer), 0, 11, true);
++        VerifyUploads(layer);
++    }
++
++    private static void GrowthFailureWithRange()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 4, 3, 2, 20);
++        layer.SyncBufferData();
++        layer.UpdateHexProgress(2, 1, .125f);
++        var original = ProgressBuffer(layer);
++        var failure = Gpu.Fail("MaterialPropertyBlock.SetBuffer");
++        Check.Same(failure, Check.Throws<InjectedFailure>(() => layer.SetCapacityHexProgressPool(128)), "Binding error identity.");
++        layer.SyncBufferData();
++        Check.Same(original, ProgressBuffer(layer), "Failed growth lost old ownership.");
++        ExpectUpload(original, 1, 1);
++        VerifyUploads(layer);
++    }
++
++    private static void FailureAfterCopy()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        layer.UpdateHexProgress(2, 1, .5f);
++        var buffer = ProgressBuffer(layer);
++        var calls = buffer.UploadCalls;
++        var failure = new InjectedFailure("post-copy");
++        Gpu.AfterUpload = _ =>
++        {
++            Gpu.AfterUpload = null;
++            throw failure;
++        };
++        Check.Same(failure, Check.Throws<InjectedFailure>(layer.SyncBufferData), "Post-copy error identity.");
++        Check.Equal(calls + 1, buffer.UploadCalls);
++        layer.SyncBufferData();
++        Check.Equal(calls + 2, buffer.UploadCalls);
++        ExpectUpload(buffer, 1, 1);
++        VerifyUploads(layer);
++    }
++
++    private static void ReleaseFailureAfterReplacement(string kind)
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        var property = kind switch { "progress" => "_HexProgressBuffer", "shell" => "_ShellBuffer", "polygon" => "_PolygonBuffer", _ => "_HexBuffer" };
++        var original = layer.props.Buffer(property);
++        Action grow = kind switch
++        {
++            "progress" => () => layer.SetCapacityHexProgressPool(128),
++            "shell" => () => layer.SetCapacityShellPool(40),
++            "polygon" => () => layer.SetCapacityPolygonPool(3),
++            _ => layer.SyncBufferData
++        };
++        if (kind == "hex")
++        {
++            layer.hexPool.Add(new Layer.HexData { shellIndex = 2 });
++            layer.hexBufferIsDirty = true;
++        }
++        var failure = Gpu.Fail("ComputeBuffer.Release");
++        Check.Same(failure, Check.Throws<InjectedFailure>(grow), "Old release replaced error.");
++        var replacement = layer.props.Buffer(property);
++        Check.True(!ReferenceEquals(original, replacement), "Successful binding lost replacement ownership.");
++        Check.Equal(1, original.ReleaseCalls);
++        layer.SyncBufferData();
++        ExpectUpload(replacement, 0, replacement.count, true);
++        VerifyUploads(layer);
++    }
++
++    private static void CleanupFailure()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        var failure = Gpu.Fail("ComputeBuffer.Release", 2);
++        var thrown = Check.Throws<InvalidOperationException>(layer.Free);
++        Check.Same(failure, thrown.InnerException, "Cleanup did not retain first native error.");
++        Check.True(Gpu.Buffers.All(buffer => buffer.ReleaseCalls == 1), "Cleanup stopped at first failure.");
++        var events = Gpu.Events.Count;
++        layer.Free(); layer.SyncBufferData(); layer.UpdateStyle(2, 6);
++        Check.Equal(events, Gpu.Events.Count, "Failed cleanup was not idempotent.");
++    }
++
++    private static void PartialModel()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        foreach (var id in new[] { 2, 19, 70 }) Add(layer, id, 4, 3, 4, id);
++        layer.SyncBufferData();
++        var random = new Random(8351);
++        for (var frame = 0; frame < 40; frame++)
++        {
++            var expectedProgress = layer.hexProgressPool.ToArray();
++            var expectedShells = layer.shellPool.ToArray();
++            for (var write = 0; write < 5; write++)
++            {
++                var id = new[] { 2, 19, 70 }[random.Next(3)];
++                var node = random.Next(4);
++                var value = random.Next(100) / 100f;
++                layer.UpdateHexProgress(id, node, value);
++                expectedProgress[expectedShells[id].progressBaseIndex + node].progress = value;
++                var state = (uint)random.Next(100);
++                layer.UpdateState(id, state);
++                expectedShells[id].state = state;
++                var style = random.Next(7);
++                layer.UpdateStyle(id, style);
++                expectedShells[id].protoId = style;
++            }
++            layer.SyncBufferData();
++            Check.Sequence(expectedProgress, ProgressBuffer(layer).Data<Layer.HexProgressData>(), "Independent full-snapshot progress model.");
++            Check.Sequence(expectedShells, AppearanceBuffer(layer).Data<Layer.ShellData>(), "Independent full-snapshot appearance model.");
++            VerifyUploads(layer);
++        }
++    }
++
++    private static void AlgorithmicCounts()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        for (var id = 1; id <= 8; id++) Add(layer, id, 8, 3, 8, id);
++        layer.SyncBufferData();
++        var progress = ProgressBuffer(layer);
++        var shell = AppearanceBuffer(layer);
++        var pCalls = progress.UploadCalls;
++        var sCalls = shell.UploadCalls;
++        var bytes = progress.UploadedBytes + shell.UploadedBytes;
++        for (var frame = 0; frame < 10; frame++) layer.SyncBufferData();
++        Check.Equal(pCalls + sCalls, progress.UploadCalls + shell.UploadCalls);
++        Console.WriteLine("COUNTS workload=unchanged frames=10 submissions=0 bytes=0 full-baseline-bytes=0");
++        var points = new int[9];
++        var offsets = Enumerable.Range(0, 9).Select(index => index * 2).ToArray();
++        for (var frame = 0; frame < 10; frame++)
++        {
++            points[3] = frame + 1;
++            Check.True(layer.TryReconcileShell(4, new[] { 3 }, points, offsets, 8, new Color32(4, 0, 0, 0),
++                (uint)(frame + 100)), "Representative reconciliation rejected.");
++            layer.SyncBufferData();
++        }
++        Check.Equal(20, progress.UploadCalls + shell.UploadCalls - pCalls - sCalls);
++        Check.Equal(440L, progress.UploadedBytes + shell.UploadedBytes - bytes);
++        Console.WriteLine("COUNTS workload=single-node-and-shell frames=10 submissions=20 bytes=440 full-baseline-submissions=20 full-baseline-bytes=6960");
++        pCalls = progress.UploadCalls; sCalls = shell.UploadCalls;
++        bytes = progress.UploadedBytes + shell.UploadedBytes;
++        layer.UpdateHexProgress(1, 1, .125f);
++        layer.UpdateHexProgress(8, 6, .75f);
++        layer.UpdateState(1, 1000);
++        layer.UpdateState(8, 1000);
++        layer.SyncBufferData();
++        Check.Equal(2, progress.UploadCalls + shell.UploadCalls - pCalls - sCalls);
++        Check.Equal(568L, progress.UploadedBytes + shell.UploadedBytes - bytes);
++        Console.WriteLine("COUNTS workload=wide-merged-spans frames=1 submissions=2 bytes=568 full-baseline-submissions=2 full-baseline-bytes=696");
++        pCalls = progress.UploadCalls; sCalls = shell.UploadCalls;
++        bytes = progress.UploadedBytes + shell.UploadedBytes;
++        for (var id = 1; id <= 8; id++)
++        {
++            for (var node = 0; node < 8; node++) layer.UpdateHexProgress(id, node, .9375f);
++            layer.UpdateState(id, 9999);
++        }
++        layer.SyncBufferData();
++        Check.Equal(2, progress.UploadCalls + shell.UploadCalls - pCalls - sCalls);
++        Check.Equal(576L, progress.UploadedBytes + shell.UploadedBytes - bytes);
++        Console.WriteLine("COUNTS workload=dense-live-range frames=1 submissions=2 bytes=576 full-baseline-submissions=2 full-baseline-bytes=696");
++        VerifyUploads(layer);
++    }
++
++    private static void ConcurrentMutation(string operation)
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 4, 3, 2, 20);
++        Add(layer, 9, 4, 3, 2, 90);
++        layer.SyncBufferData();
++        layer.UpdateHexProgress(2, 1, .125f);
++        using var copied = new ManualResetEventSlim();
++        using var resume = new ManualResetEventSlim();
++        Gpu.AfterUpload = _ =>
++        {
++            Gpu.AfterUpload = null;
++            copied.Set();
++            Check.True(resume.Wait(TimeSpan.FromSeconds(5)), "Paused upload never resumed.");
++        };
++        var sync = Task.Run(layer.SyncBufferData);
++        Exception workerError = null;
++        var worker = new Thread(() =>
++        {
++            try
++            {
++                switch (operation)
++                {
++                    case "updates":
++                        layer.UpdateHexProgress(2, 0, .75f);
++                        layer.UpdateColor(2, new Color32(1, 2, 3, 4));
++                        layer.UpdateState(2, 123); layer.UpdateStyle(2, 6);
++                        break;
++                    case "reconcile":
++                        Check.True(layer.TryReconcileShell(2, new[] { 0, 1 }, new[] { 1, 2, 3, 4, 0 },
++                            new[] { 0, 2, 4, 6, 8 }, 4, new Color32(1, 2, 3, 4), 999), "Concurrent reconciliation rejected.");
++                        break;
++                    case "remove": layer.RemoveDysonShell(2); break;
++                    case "grow": layer.SetCapacityHexProgressPool(128); layer.SetCapacityShellPool(40); break;
++                    case "replace": layer.AddShellData(2, default); break;
++                    case "free": layer.Free(); break;
++                }
++            }
++            catch (Exception error) { workerError = error; }
++        });
++        try
++        {
++            Check.True(copied.Wait(TimeSpan.FromSeconds(5)), "Upload never reached the post-copy boundary.");
++            worker.Start();
++            Check.True(SpinWait.SpinUntil(() => !worker.IsAlive ||
++                (worker.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0, TimeSpan.FromSeconds(5)), "Worker never reached mutation boundary.");
++        }
++        finally
++        {
++            resume.Set();
++            Check.True(sync.Wait(TimeSpan.FromSeconds(5)), "Sync did not complete.");
++            if (worker.ThreadState != System.Threading.ThreadState.Unstarted)
++                Check.True(worker.Join(TimeSpan.FromSeconds(5)), "Worker did not complete.");
++            Gpu.AfterUpload = null;
++        }
++        if (workerError != null) throw new InvalidOperationException("Worker mutation failed.", workerError);
++        if (operation == "free")
++        {
++            var events = Gpu.Events.Count;
++            layer.SyncBufferData(); layer.UpdateHexProgress(2, 0, .5f); layer.Free();
++            Check.Equal(events, Gpu.Events.Count, "Callback touched resources after concurrent cleanup.");
++        }
++        else
++        {
++            layer.SyncBufferData();
++            VerifyUploads(layer);
++            var events = Gpu.Events.Count;
++            layer.SyncBufferData();
++            Check.Equal(events, Gpu.Events.Count, "Concurrent mutation retained completed invalidation.");
++        }
++    }
++}
+diff --git a/tests/SphereOpt.LayerTests/Program.cs b/tests/SphereOpt.LayerTests/Program.cs
+index fb2344b11c2d7856e4b356790dcea17915079d20..97a1184b152990e840e83bf2091ddc0bad898413 100644
+--- a/tests/SphereOpt.LayerTests/Program.cs
++++ b/tests/SphereOpt.LayerTests/Program.cs
+@@ -12,7 +12,7 @@ internal static class Program
+             Console.Error.WriteLine("Usage: SphereOpt.LayerTests [--repeat positive-integer]");
+             return 2;
+         }
+-        Console.WriteLine("API/lifecycle simulation of linked real InstDysonShellLayer + PoolCompaction; NOT a native GPU test.");
++        Console.WriteLine("API/lifecycle simulation of linked real InstDysonShellLayer + PoolCompaction + DirtyRange + ShellBatchPolicy; NOT a native GPU test.");
+         var tests = LayerTests.Cases().Append(("Isolation/no game or plugin runtime loaded", (Action)Isolated)).ToArray();
+         var failed = 0;
+         var stopwatch = Stopwatch.StartNew();
+diff --git a/tests/SphereOpt.LayerTests/ReconcileTests.cs b/tests/SphereOpt.LayerTests/ReconcileTests.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b501003898b4d5d15cd9a6984380f282aca580e
+--- /dev/null
++++ b/tests/SphereOpt.LayerTests/ReconcileTests.cs
+@@ -0,0 +1,199 @@
++using UnityEngine;
++using Layer = SphereOpt.InstDysonShellLayer;
++
++namespace SphereOpt.LayerTests;
++
++internal static partial class LayerTests
++{
++    private static IEnumerable<(string Name, Action Run)> ReconcileCases()
++    {
++        yield return ("Policy/dirty span empty, merge, reverse order and clear", DirtyRangePolicy);
++        yield return ("Policy/progress helper preserves validity, clamping and overflow contracts", ProgressPolicy);
++        yield return ("Reconcile/sparse shell resolves current allocation and updates exact payload", ReconcilePayload);
++        yield return ("Reconcile/unchanged values submit nothing", UnchangedReconcile);
++        yield return ("Reconcile/current input guards reject invalid node and progress ranges", ReconcileGuards);
++        yield return ("Reconcile/later invalid node preserves earlier pending writes for retry", ReconcilePartialRejection);
++        yield return ("Reconcile/remove and re-add resolves rebased allocation each call", ReconcileCompaction);
++    }
++
++    private static void DirtyRangePolicy()
++    {
++        var range = new DirtyRange();
++        Check.True(!range.IsDirty, "Default range dirty.");
++        Check.Equal(0, range.Count);
++        range.Include(12);
++        Check.Equal(12, range.Start); Check.Equal(1, range.Count);
++        range.Include(12);
++        Check.Equal(1, range.Count);
++        range.Include(18); range.Include(3); range.Include(7);
++        Check.Equal(3, range.Start); Check.Equal(16, range.Count);
++        range.Clear();
++        Check.True(!range.IsDirty, "Cleared range retained invalidation.");
++        range.Include(int.MaxValue - 1);
++        Check.Equal(int.MaxValue - 1, range.Start); Check.Equal(1, range.Count);
++        range.Include(0);
++        Check.Equal(int.MaxValue, range.Count);
++        range.Clear(); range.Clear();
++        Check.Equal(0, range.Count);
++    }
++
++    private static void ProgressPolicy()
++    {
++        foreach (var (points, start, end, perVertex, valid, expected) in new[]
++        {
++            (0, 0, 4, 2, true, 0f), (2, 1, 5, 2, true, .25f),
++            (8, 1, 5, 2, true, 1f), (99, 1, 5, 2, true, 1f),
++            (-1, 0, 4, 2, false, 0f), (1, -1, 4, 2, false, 0f),
++            (1, 4, 4, 2, false, 0f), (1, 5, 4, 2, false, 0f),
++            (1, 0, 4, 0, false, 0f), (1, 0, 4, -1, false, 0f),
++            (int.MaxValue, int.MaxValue - 1, int.MaxValue, int.MaxValue, true, 1f),
++            (int.MaxValue, 0, int.MaxValue, int.MaxValue, true, (float)(1d / int.MaxValue))
++        })
++        {
++            Check.Equal(valid, ShellBatchPolicy.TryGetProgress(points, start, end, perVertex, out var actual));
++            Check.Equal(expected, actual);
++            Check.Equal(expected, ShellBatchPolicy.GetProgress(points, start, end, perVertex));
++            Check.Equal(valid, ShellBatchPolicy.HasValidProgress(points, start, end, perVertex, 1f));
++        }
++        foreach (var fill in new[] { float.NaN, float.PositiveInfinity, float.NegativeInfinity, -.1f, 1.1f })
++            Check.True(!ShellBatchPolicy.HasValidProgress(1, 0, 2, 1, fill), "Unsupported fill order accepted.");
++        Check.True(ShellBatchPolicy.HasValidProgress(1, 0, 2, 1, 0f), "Zero fill order rejected.");
++    }
++
++    private static void ReconcilePayload()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 2, 3, 2, 20);
++        Add(layer, 70, 4, 3, 2, 70);
++        layer.SyncBufferData();
++        var original = layer.shellPool[70];
++        Check.True(layer.TryReconcileShell(70, new[] { 3, 0, 2 }, new[] { 2, 99, 100, 0, 0 },
++            new[] { 0, 2, 5, 10, 14 }, 4, new Color32(0x12, 0x34, 0x56, 0x78), 321), "Valid reconciliation rejected.");
++        Check.Equal(.25f, layer.hexProgressPool[2].progress);
++        Check.Equal(71f, layer.hexProgressPool[3].progress, "Unreferenced node was overwritten.");
++        Check.Equal(1f, layer.hexProgressPool[4].progress, "Progress failed to clamp.");
++        Check.Equal(0f, layer.hexProgressPool[5].progress);
++        var actual = layer.shellPool[70];
++        Check.Equal(unchecked((int)0x78563412), actual.color);
++        Check.Equal(321u, actual.state);
++        Check.Equal(original.progressBaseIndex, actual.progressBaseIndex);
++        Check.Equal(original.polygonIndex, actual.polygonIndex);
++        Check.Equal(original.polyCount, actual.polyCount);
++        Check.Equal(original.protoId, actual.protoId);
++        Check.True(!layer.hexProgressBufferIsDirty && !layer.shellBufferIsDirty, "Reconcile converted precise writes to full uploads.");
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 2, 4);
++        ExpectUpload(AppearanceBuffer(layer), 70, 1);
++        VerifyUploads(layer);
++    }
++
++    private static void UnchangedReconcile()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        var nodes = new[] { 0, 2 };
++        var points = new[] { 2, 0, 4, 0 };
++        var offsets = new[] { 0, 2, 4, 6 };
++        var color = new Color32(1, 2, 3, 4);
++        Check.True(layer.TryReconcileShell(2, nodes, points, offsets, 4, color, 123), "Valid initial reconcile rejected.");
++        layer.SyncBufferData();
++        var events = Gpu.Events.Count;
++        Check.True(layer.TryReconcileShell(2, nodes, points, offsets, 4, color, 123), "Unchanged reconcile rejected.");
++        layer.SyncBufferData();
++        Check.Equal(events, Gpu.Events.Count, "Unchanged reconciliation uploaded data.");
++        // Referenced source arrays retain identity but values change every frame.
++        points[2] = 6;
++        Check.True(layer.TryReconcileShell(2, nodes, points, offsets, 4, color, 123), "Changed points rejected.");
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 2, 1);
++        Check.Equal(.75f, ProgressBuffer(layer).Data<Layer.HexProgressData>()[2].progress);
++        VerifyUploads(layer);
++    }
++
++    private static void ReconcileGuards()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        var points = new[] { 2, 4, 6, 0 };
++        var offsets = new[] { 0, 2, 4, 6 };
++        var events = Gpu.Events.Count;
++        bool Reconcile(int id, int[] nodes, int[] cps, int[] starts, int per = 4)
++            => layer.TryReconcileShell(id, nodes, cps, starts, per, new Color32(1, 2, 3, 4), 999);
++        foreach (var missing in new[] { -1, 0, 10, int.MaxValue })
++            Check.True(!Reconcile(missing, new[] { 0 }, points, offsets), "Missing allocation accepted.");
++        Check.True(!Reconcile(2, null, points, offsets), "Missing node references accepted.");
++        Check.True(!Reconcile(2, new[] { 0 }, null, offsets), "Missing points accepted.");
++        Check.True(!Reconcile(2, new[] { 0 }, points, null), "Missing offsets accepted.");
++        foreach (var node in new[] { -1, 3, int.MaxValue })
++            Check.True(!Reconcile(2, new[] { node }, points, offsets), "Node boundary accepted.");
++        Check.True(!Reconcile(2, new[] { 0 }, new[] { 1 }, offsets), "Last node without points trailer accepted.");
++        Check.True(!Reconcile(2, new[] { 0 }, points, new[] { 0 }), "Missing end offset accepted.");
++        Check.True(!Reconcile(2, new[] { 0 }, new[] { -1, 0 }, new[] { 0, 1 }), "Negative points accepted.");
++        foreach (var invalidOffsets in new[] { new[] { -1, 2 }, new[] { 2, 2 }, new[] { 3, 2 } })
++            Check.True(!Reconcile(2, new[] { 0 }, points, invalidOffsets), "Invalid interval accepted.");
++        foreach (var per in new[] { 0, -1 })
++            Check.True(!Reconcile(2, new[] { 0 }, points, offsets, per), "Invalid points-per-vertex accepted.");
++        layer.RegisterProgressCount(2, 1);
++        Check.True(!Reconcile(2, new[] { 1 }, points, offsets), "Node beyond owned allocation accepted.");
++        layer.SyncBufferData();
++        Check.Equal(events, Gpu.Events.Count, "First-node rejection dirtied storage.");
++        // Revalidate values on each call even with identical array references.
++        offsets[1] = 0;
++        Check.True(!Reconcile(2, new[] { 0 }, points, offsets), "Mutable interval guard was cached.");
++        layer.Free();
++        Check.True(!Reconcile(2, new[] { 0 }, points, offsets), "Freed layer accepted reconciliation.");
++    }
++
++    private static void ReconcilePartialRejection()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 3, 3, 2, 20);
++        layer.SyncBufferData();
++        var nodes = new[] { 0, 1 };
++        var cps = new[] { 2, -1, 0, 0 };
++        var offsets = new[] { 0, 2, 4, 6 };
++        Check.True(!layer.TryReconcileShell(2, nodes, cps, offsets, 4, new Color32(1, 2, 3, 4), 999), "Later invalid points accepted.");
++        Check.Equal(.25f, layer.hexProgressPool[0].progress);
++        Check.Equal(20u, layer.shellPool[2].state, "Rejected reconcile changed appearance.");
++        cps[1] = 4;
++        Check.True(layer.TryReconcileShell(2, nodes, cps, offsets, 4, new Color32(1, 2, 3, 4), 999), "Retry rejected repaired input.");
++        layer.SyncBufferData();
++        ExpectUpload(ProgressBuffer(layer), 0, 2);
++        Check.Equal(.5f, layer.hexProgressPool[1].progress);
++        VerifyUploads(layer);
++    }
++
++    private static void ReconcileCompaction()
++    {
++        using var fixture = new Fixture();
++        var layer = fixture.Layer;
++        Add(layer, 2, 2, 3, 2, 20);
++        Add(layer, 70, 3, 3, 2, 70);
++        layer.SyncBufferData();
++        var nodes = new[] { 1 };
++        var cps = new[] { 0, 4, 0, 0 };
++        var offsets = new[] { 0, 2, 4, 6 };
++        var color = new Color32(1, 2, 3, 4);
++        Check.True(layer.TryReconcileShell(70, nodes, cps, offsets, 4, color, 123), "Initial reconcile rejected.");
++        layer.RemoveDysonShell(2);
++        cps[1] = 6;
++        Check.True(layer.TryReconcileShell(70, nodes, cps, offsets, 4, color, 124), "Rebased reconcile rejected.");
++        layer.SyncBufferData();
++        Check.Equal(.75f, ProgressBuffer(layer).Data<Layer.HexProgressData>()[1].progress);
++        layer.RemoveDysonShell(70);
++        Check.True(!layer.TryReconcileShell(70, nodes, cps, offsets, 4, color, 124), "Removed allocation reused.");
++        Add(layer, 2, 4, 3, 2, 30);
++        Add(layer, 70, 3, 3, 2, 80);
++        cps[1] = 2;
++        Check.True(layer.TryReconcileShell(70, nodes, cps, offsets, 4, color, 125), "Re-added allocation rejected.");
++        layer.SyncBufferData();
++        Check.Equal(.25f, ProgressBuffer(layer).Data<Layer.HexProgressData>()[5].progress);
++        Check.Equal(31f, ProgressBuffer(layer).Data<Layer.HexProgressData>()[1].progress, "Re-added reconcile wrote stale old base.");
++        VerifyUploads(layer);
++    }
++}
+diff --git a/tests/SphereOpt.LayerTests/SphereOpt.LayerTests.csproj b/tests/SphereOpt.LayerTests/SphereOpt.LayerTests.csproj
+index c624f74500ee407521c26487cae8bda7bd23f5d2..e8c94a1f97cf7d225eec1ffe6de62b0a53163da6 100644
+--- a/tests/SphereOpt.LayerTests/SphereOpt.LayerTests.csproj
++++ b/tests/SphereOpt.LayerTests/SphereOpt.LayerTests.csproj
+@@ -9,5 +9,7 @@
+   <ItemGroup>
+     <Compile Include="../../InstDysonShellLayer.cs" Link="Production/InstDysonShellLayer.cs" />
+     <Compile Include="../../PoolCompaction.cs" Link="Production/PoolCompaction.cs" />
++    <Compile Include="../../DirtyRange.cs" Link="Production/DirtyRange.cs" />
++    <Compile Include="../../ShellBatchPolicy.cs" Link="Production/ShellBatchPolicy.cs" />
+   </ItemGroup>
+ </Project>
+diff --git a/tests/SphereOpt.LayerTests/UnityStubs.cs b/tests/SphereOpt.LayerTests/UnityStubs.cs
+index 7117f124956f674ed6769d1cc9fffb76404bfef9..5eb1ac5c0d227b691260cfeb2e88b11a36955ee2 100644
+--- a/tests/SphereOpt.LayerTests/UnityStubs.cs
++++ b/tests/SphereOpt.LayerTests/UnityStubs.cs
+@@ -14,6 +14,7 @@ namespace UnityEngine
+             if (target == null) return;
+             target.DestroyCalls++;
+             Gpu.Events.Add($"destroy:{target.GetType().Name}");
++            Gpu.Hit("Object.Destroy");
+         }
+     }
+ 
+@@ -74,6 +75,9 @@ namespace UnityEngine
+         internal int UploadCalls { get; private set; }
+         internal bool IsReleased => ReleaseCalls != 0;
+         internal Array Uploaded { get; private set; }
++        internal List<UploadRecord> Uploads { get; } = new();
++        internal long UploadedBytes => Uploads.Sum(upload => (long)upload.Count * Stride);
++        internal readonly record struct UploadRecord(int Source, int Destination, int Count, bool Full);
+ 
+         public ComputeBuffer(int count, int stride)
+         {
+@@ -88,23 +92,31 @@ namespace UnityEngine
+             Gpu.Events.Add($"allocate:ComputeBuffer:{Id}:{count}:{stride}");
+         }
+ 
+-        public void SetData(Array data) => Upload(data);
+-        public void SetData<T>(List<T> data) where T : struct => Upload(data.ToArray());
++        public void SetData(Array data) => Upload(data, 0, 0, data?.Length ?? 0, true);
++        public void SetData<T>(List<T> data) where T : struct => SetData(data.ToArray());
++        public void SetData(Array data, int managedBufferStartIndex, int computeBufferStartIndex, int count)
++            => Upload(data, managedBufferStartIndex, computeBufferStartIndex, count, false);
+ 
+-        private void Upload(Array data)
++        private void Upload(Array data, int source, int destination, int length, bool full)
+         {
+             Gpu.Hit("ComputeBuffer.SetData");
+             RequireLive();
+-            if (data == null || data.Length > count) throw new ArgumentException("Upload exceeds buffer capacity.");
+-            Uploaded = (Array)data.Clone();
++            if (data == null || source < 0 || destination < 0 || length < 0 || source > data.Length - length ||
++                destination > count - length) throw new ArgumentException("Upload exceeds buffer capacity.");
++            Gpu.BeforeUpload?.Invoke(this);
++            if (Uploaded == null) Uploaded = Array.CreateInstance(data.GetType().GetElementType()!, count);
++            Array.Copy(data, source, Uploaded, destination, length);
+             UploadCalls++;
+-            Gpu.Events.Add($"upload:{Id}:{data.Length}");
++            Uploads.Add(new UploadRecord(source, destination, length, full));
++            Gpu.Events.Add($"upload:{Id}:{length}");
++            Gpu.AfterUpload?.Invoke(this);
+         }
+ 
+         public void Release()
+         {
+             ReleaseCalls++;
+             Gpu.Events.Add($"release:{Id}");
++            Gpu.Hit("ComputeBuffer.Release");
+         }
+ 
+         internal void RequireLive()
+@@ -181,6 +193,8 @@ namespace SphereOpt.LayerTests
+         internal static readonly List<string> Events = new();
+         internal static int BufferConstructorAttempts;
+         internal static int ZeroCountAttempts;
++        internal static Action<UnityEngine.ComputeBuffer> BeforeUpload;
++        internal static Action<UnityEngine.ComputeBuffer> AfterUpload;
+         private static string faultOperation;
+         private static int faultCountdown;
+         private static InjectedFailure pendingFailure;
+@@ -191,6 +205,8 @@ namespace SphereOpt.LayerTests
+             Materials.Clear();
+             Events.Clear();
+             BufferConstructorAttempts = ZeroCountAttempts = 0;
++            BeforeUpload = null;
++            AfterUpload = null;
+             ClearFault();
+             InstDysonShellRenderer.HexMat = UnityEngine.Material.CreateTemplate();
+             InstDysonShellRenderer.HexMat.SetInt(UnityEngine.Shader.PropertyToID("_Stencil"), 17);
+diff --git a/tests/SphereOpt.RenderTests/AllocationTests.cs b/tests/SphereOpt.RenderTests/AllocationTests.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8e0dee799ce9bdf9559c854dfb1c2210171abb4
+--- /dev/null
++++ b/tests/SphereOpt.RenderTests/AllocationTests.cs
+@@ -0,0 +1,89 @@
++using System.Runtime.CompilerServices;
++using System.Runtime.InteropServices;
++using System.Text.Json;
++using Plugin = SphereOpt.SphereOpt;
++
++namespace SphereOpt.RenderTests;
++
++internal static class AllocationTests
++{
++    private const int Warmup = 20_000;
++    private const int Iterations = 100_000;
++    private static object lastState;
++
++    internal static IEnumerable<(string, Action)> Cases()
++    {
++        foreach (var path in new[] { "inactive", "profiler", "unsupported", "missing-player", "zero-mask" })
++        {
++            var selected = path;
++            yield return ($"Allocations/{path} measures real prefix and finalizer through cached delegates", () => Measure(selected));
++        }
++    }
++
++    private static void Measure(string path)
++    {
++        var fixture = new Fixture(0);
++        switch (path)
++        {
++            case "inactive": Plugin.Active = false; break;
++            case "profiler": PerformanceMonitor.GpuProfilerOn = true; break;
++            case "unsupported": DysonSphere.renderPlace = ERenderPlace.Unsupported; break;
++            case "missing-player": fixture.Sphere.gameData.mainPlayer = null; break;
++        }
++        var place = path == "unsupported" ? ERenderPlace.Unsupported : ERenderPlace.Universe;
++        Plugin.RecordEvents = false;
++        var prefix = PatchAccess.DirectPrefix;
++        var finalizer = PatchAccess.DirectFinalizer;
++        var expectedOriginal = path != "missing-player";
++        try
++        {
++            Run(prefix, finalizer, fixture.Segment, place, Warmup, out var warmOriginals);
++            Check.Equal(expectedOriginal ? Warmup : 0, warmOriginals, "Warmup must reach the requested guard");
++            var before = GC.GetAllocatedBytesForCurrentThread();
++            Run(prefix, finalizer, fixture.Segment, place, Iterations, out var originals);
++            var bytes = GC.GetAllocatedBytesForCurrentThread() - before;
++            Check.Equal(expectedOriginal ? Iterations : 0, originals, "Measured guard continuation");
++            Check.True(lastState != null, "Measured prefix must return a real per-call state");
++            Check.True(bytes > 0, "Measurement must include the unique per-call context allocation");
++            Check.Equal(path == "zero-mask" ? Warmup + Iterations : 0, Plugin.LookupCount, "Measured lookup boundary");
++            Check.Equal(path == "zero-mask" ? Warmup + Iterations : 0, fixture.Native.PreparationCount,
++                "Measured PrepareFrame boundary");
++            Check.Equal(0, fixture.Native.SubmissionCount, "Bypass benchmark must not submit shells");
++            Check.Equal(0, Plugin.Lookups.Count + fixture.Native.PrepareCalls.Count + fixture.Native.RenderCalls.Count +
++                fixture.Native.Callbacks.Count + Plugin.DisableCalls.Count, "Fake event recording must be allocation-free and empty");
++            PatchAccess.AssertClear();
++            Console.WriteLine("ALLOCATION " + JsonSerializer.Serialize(new
++            {
++                path, iterations = Iterations, warmup = Warmup, bytes,
++                bytesPerCall = (double)bytes / Iterations,
++                framework = RuntimeInformation.FrameworkDescription,
++                architecture = RuntimeInformation.ProcessArchitecture.ToString(),
++                managedHostOnly = true, reflectionInMeasuredLoop = false, fakeEvents = false
++            }));
++        }
++        finally
++        {
++            lastState = null;
++            Plugin.RecordEvents = true;
++            Plugin.Active = true;
++            PerformanceMonitor.GpuProfilerOn = false;
++            DysonSphere.renderPlace = ERenderPlace.Universe;
++        }
++    }
++
++    [MethodImpl(MethodImplOptions.NoInlining)]
++    private static void Run(PatchAccess.PrefixCall prefix, Action<object> finalizer,
++        DysonSphereSegmentRenderer renderer, ERenderPlace place, int iterations, out int originals)
++    {
++        originals = 0;
++        object state = null;
++        for (var i = 0; i < iterations; i++)
++        {
++            if (prefix(renderer, place, 0x246, 0x6aa, out state)) originals++;
++            finalizer(state);
++        }
++        // Keep the state observable without allocating a list or assertion
++        // message in the measured region. Production also stores it in current.
++        lastState = state;
++    }
++}
+diff --git a/tests/SphereOpt.RenderTests/Fakes.cs b/tests/SphereOpt.RenderTests/Fakes.cs
+index c0125541ba5a70b5b607f466f23344c8816168f4..a6f02286fe94bd6d04a3d9aec4cca518a4b05e26 100644
+--- a/tests/SphereOpt.RenderTests/Fakes.cs
++++ b/tests/SphereOpt.RenderTests/Fakes.cs
+@@ -38,10 +38,13 @@ namespace SphereOpt
+         internal static readonly List<Exception> DisableCalls = new();
+         internal static Exception LookupFailure;
+         internal static int ReleaseCalls;
++        internal static bool RecordEvents = true;
++        internal static int LookupCount;
+ 
+         public static InstDysonShellRenderer getInstDysonShellRendererForSphere(DysonSphere sphere)
+         {
+-            Lookups.Add(sphere);
++            LookupCount++;
++            if (RecordEvents) Lookups.Add(sphere);
+             if (LookupFailure != null) throw LookupFailure;
+             return Renderers[sphere];
+         }
+@@ -63,6 +66,8 @@ namespace SphereOpt
+             DisableCalls.Clear();
+             LookupFailure = null;
+             ReleaseCalls = 0;
++            LookupCount = 0;
++            RecordEvents = true;
+             PerformanceMonitor.GpuProfilerOn = false;
+             DysonSphere.renderPlace = ERenderPlace.Universe;
+         }
+@@ -78,13 +83,17 @@ namespace SphereOpt
+         internal Action Preparing;
+         internal Action BeforeSubmission;
+         internal Action<int> AfterCallback;
++        internal Action<int> LastSubmitted;
++        internal int PreparationCount;
++        internal int SubmissionCount;
+         internal readonly List<(ERenderPlace Place, int EditorMask, int GameMask)> PrepareCalls = new();
+         internal readonly List<(ERenderPlace Place, int EditorMask, int GameMask)> RenderCalls = new();
+         internal readonly List<int> Callbacks = new();
+ 
+         internal int PrepareFrame(ERenderPlace place, int editorMask, int gameMask)
+         {
+-            PrepareCalls.Add((place, editorMask, gameMask));
++            PreparationCount++;
++            if (SphereOpt.RecordEvents) PrepareCalls.Add((place, editorMask, gameMask));
+             Preparing?.Invoke();
+             if (PreparationFailure != null) throw PreparationFailure;
+             return PreparedMask;
+@@ -92,13 +101,15 @@ namespace SphereOpt
+ 
+         internal void RenderShells(ERenderPlace place, int editorMask, int gameMask, Action<int> submitted)
+         {
+-            RenderCalls.Add((place, editorMask, gameMask));
++            SubmissionCount++;
++            LastSubmitted = submitted;
++            if (SphereOpt.RecordEvents) RenderCalls.Add((place, editorMask, gameMask));
+             BeforeSubmission?.Invoke();
+             ThrowAt(0);
+             foreach (var id in SuccessfulLayers)
+             {
+                 // The fake reports success only after its simulated submission.
+-                Callbacks.Add(id);
++                if (SphereOpt.RecordEvents) Callbacks.Add(id);
+                 submitted(id);
+                 AfterCallback?.Invoke(id);
+                 ThrowAt(Callbacks.Count);
+diff --git a/tests/SphereOpt.RenderTests/PooledContextTests.cs b/tests/SphereOpt.RenderTests/PooledContextTests.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3fb3b188b0952394511e66f93a7ad79ad470f507
+--- /dev/null
++++ b/tests/SphereOpt.RenderTests/PooledContextTests.cs
+@@ -0,0 +1,360 @@
++using System.Reflection;
++using Plugin = SphereOpt.SphereOpt;
++
++namespace SphereOpt.RenderTests;
++
++internal static class PoolAccess
++{
++    internal static object Available => typeof(Patch_DysonSphereSegmentRenderer)
++        .GetField("available", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
++    internal static T Field<T>(object owner, string name) => (T)owner.GetType()
++        .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public).GetValue(owner);
++    internal static object Data(object state) => Field<object>(state, "Data");
++
++    internal static void AssertReset(object data)
++    {
++        Check.True(data != null, "Test must inspect an actual borrowed payload");
++        Check.True(Field<object>(data, "Sphere") == null, "Returned payload retains a sphere");
++        Check.Equal(0, Field<int>(data, "Mask"), "Returned payload retains submitted mask bits");
++        var layers = Field<DysonSphereLayer[]>(data, "Layers");
++        Check.Equal(11, layers.Length, "Payload layer array shape");
++        Check.True(layers.All(layer => layer == null), "Returned payload retains layer references");
++    }
++
++    internal static void AssertReleased(object state, object data = null)
++    {
++        Check.True(Field<bool>(state, "Released"), "Matching finalizer must retire the per-call wrapper");
++        Check.True(Field<object>(state, "Previous") == null, "Retired wrapper retains its predecessor");
++        Check.True(Data(state) == null, "Retired wrapper retains its borrowed payload");
++        if (data != null)
++        {
++            AssertReset(data);
++            Check.Same(data, Available, "Matching finalizer must return the payload to the owning thread's pool");
++        }
++    }
++}
++
++internal static class PooledContextTests
++{
++    private const int AllLayers = 0x7fe;
++
++    internal static IEnumerable<(string, Action)> Cases()
++    {
++        yield return ("Pool/success clears sphere, every layer, mask and wrapper links", SuccessReset);
++        yield return ("Pool/sequential draws reuse payload, array and submitted delegate with fresh wrappers", SequentialReuse);
++        yield return ("Pool/nested peak payloads stay distinct and are reused on the next nesting", NestedReuse);
++        yield return ("Pool/preparation borrows only after nonzero readiness and nested preparation", BorrowAfterPreparation);
++        foreach (var phase in Enum.GetValues<Failure>())
++        {
++            var selected = phase;
++            yield return ($"Pool/{phase} failure clears references and preserves the next borrower", () => FailureReset(selected));
++        }
++        yield return ("Pool/old top-level finalizer cannot retire a later borrower (ABA)", () => OldFinalizer(false));
++        yield return ("Pool/old nested finalizer cannot retire a later borrower (ABA)", () => OldFinalizer(true));
++        yield return ("Finalizer/out-of-order outer state cannot pop an active inner context", () => OutOfOrder(false));
++        yield return ("Finalizer/out-of-order outer state cannot pop a bypassed inner context", () => OutOfOrder(true));
++        yield return ("Finalizer/default, foreign and unowned wrapper states preserve the live context", UnownedStates);
++        yield return ("ThreadStatic/payload pool and callbacks stay on their owning thread", ThreadPoolIsolation);
++    }
++
++    private static void SuccessReset()
++    {
++        var fixture = new Fixture(AllLayers, Enumerable.Range(1, 10).ToArray());
++        var draw = PatchAccess.Begin(fixture.Segment);
++        var data = PoolAccess.Data(draw.State);
++        try
++        {
++            fixture.AssertCursors(AllLayers);
++            Check.Equal(AllLayers, PoolAccess.Field<int>(data, "Mask"), "Completed callbacks must populate the real payload");
++            Check.Same(fixture.Sphere, PoolAccess.Field<object>(data, "Sphere"), "Active sphere reference");
++            for (var id = 1; id <= 10; id++)
++                Check.Same(fixture.Sphere.layersIdBased[id], PoolAccess.Field<DysonSphereLayer[]>(data, "Layers")[id],
++                    "Every submitted layer reference must be captured before reset");
++        }
++        finally { draw.Dispose(); }
++        PoolAccess.AssertReleased(draw.State, data);
++        fixture.AssertCursors(0);
++    }
++
++    private static void SequentialReuse()
++    {
++        var a = new Fixture(AllLayers, 1, 10);
++        var b = new Fixture(AllLayers, 2);
++        var first = PatchAccess.Begin(a.Segment);
++        var data = PoolAccess.Data(first.State);
++        var layers = PoolAccess.Field<DysonSphereLayer[]>(data, "Layers");
++        var submitted = a.Native.LastSubmitted;
++        first.Dispose();
++        PoolAccess.AssertReleased(first.State, data);
++        var reached = 0;
++        b.Native.BeforeSubmission = () =>
++        {
++            reached++;
++            var next = PoolAccess.Data(PatchAccess.CurrentContext);
++            Check.Same(data, next, "Next draw must borrow the returned payload");
++            Check.Equal(0, PoolAccess.Field<int>(next, "Mask"), "Next draw starts without stale mask bits");
++            Check.True(layers.All(layer => layer == null), "Next draw starts without stale layer references");
++            Check.Same(b.Sphere, PoolAccess.Field<object>(next, "Sphere"), "New sphere replaces the prior owner");
++            Check.True(PoolAccess.Field<object>(next, "Next") == null, "Borrowed payload must detach its free-list link");
++        };
++        object secondState;
++        using (var second = PatchAccess.Begin(b.Segment))
++        {
++            secondState = second.State;
++            Check.Equal(1, reached, "Second submission reached the empty payload check");
++            Check.True(!ReferenceEquals(first.State, second.State), "Each call must retain a unique wrapper");
++            Check.Same(data, PoolAccess.Data(second.State), "Payload identity must be reused");
++            Check.Same(layers, PoolAccess.Field<object>(data, "Layers"), "Eleven-element array identity must be reused");
++            Check.Same(submitted, b.Native.LastSubmitted, "Cached submission delegate identity must be reused");
++            Check.Same(PoolAccess.Field<object>(data, "Submitted"), b.Native.LastSubmitted, "Renderer receives the cached callback");
++            a.AssertCursors(0);
++            b.AssertCursors(1 << 2);
++        }
++        PoolAccess.AssertReset(data);
++        b.Native.SuccessfulLayers = [];
++        using var unsubmitted = PatchAccess.Begin(b.Segment);
++        Check.Equal(2, reached, "Same-sphere nonzero preparation without callbacks reached rendering");
++        Check.Same(data, PoolAccess.Data(unsubmitted.State), "Same sphere reuses its cleared payload without callbacks");
++        Check.True(!ReferenceEquals(first.State, unsubmitted.State) && !ReferenceEquals(secondState, unsubmitted.State),
++            "Every active call receives a new wrapper even when nothing is submitted");
++        Check.Same(submitted, b.Native.LastSubmitted, "No-callback render still receives the same cached delegate");
++        b.AssertCursors(0);
++    }
++
++    private static void NestedReuse()
++    {
++        var fixtures = Enumerable.Range(1, 3).Select(id => new Fixture(AllLayers, id)).ToArray();
++        var payloads = new object[3];
++        var arrays = new object[3];
++        var callbacks = new Action<int>[3];
++        var states = new HashSet<object>(ReferenceEqualityComparer.Instance);
++        for (var pass = 0; pass < 2; pass++)
++        {
++            var calls = new List<DrawCall>();
++            var activeData = new object[3];
++            try
++            {
++                for (var depth = 0; depth < 3; depth++)
++                {
++                    var call = PatchAccess.Begin(fixtures[depth].Segment);
++                    calls.Add(call);
++                    Check.True(states.Add(call.State), "Nested and repeated invocations require fresh wrappers");
++                    var data = PoolAccess.Data(call.State);
++                    activeData[depth] = data;
++                    Check.True(calls.Take(depth).All(previous => !ReferenceEquals(data, PoolAccess.Data(previous.State))),
++                        "Active nesting depths cannot share a payload");
++                    Check.True(PoolAccess.Field<object>(data, "Next") == null, "Active payload must detach its pool link");
++                    if (pass == 0)
++                    {
++                        payloads[depth] = data;
++                        arrays[depth] = PoolAccess.Field<object>(data, "Layers");
++                        callbacks[depth] = fixtures[depth].Native.LastSubmitted;
++                    }
++                    else
++                    {
++                        Check.Same(payloads[depth], data, "Repeated peak nesting must reuse each returned payload");
++                        Check.Same(arrays[depth], PoolAccess.Field<object>(data, "Layers"), "Nested layer-array identity reuse");
++                        Check.Same(callbacks[depth], fixtures[depth].Native.LastSubmitted, "Nested callback identity reuse");
++                    }
++                    fixtures[depth].AssertCursors(1 << (depth + 1));
++                }
++            }
++            finally
++            {
++                for (var depth = calls.Count - 1; depth >= 0; depth--)
++                {
++                    calls[depth].Dispose();
++                    PoolAccess.AssertReleased(calls[depth].State, activeData[depth]);
++                }
++            }
++        }
++    }
++
++    private static void BorrowAfterPreparation()
++    {
++        var fixture = new Fixture(AllLayers, 1);
++        var inner = new Fixture(AllLayers, 4);
++        var reached = 0;
++        fixture.Native.Preparing = () =>
++        {
++            reached++;
++            Check.True(PoolAccess.Data(PatchAccess.CurrentContext) == null, "Pending preparation must not have borrowed a payload");
++            using (PatchAccess.Begin(inner.Segment)) inner.AssertCursors(1 << 4);
++            Check.True(PoolAccess.Data(PatchAccess.CurrentContext) == null, "Preparation reentry must restore an unborrowed outer context");
++        };
++        using var draw = PatchAccess.Begin(fixture.Segment);
++        Check.Equal(1, reached, "Nonzero preparation path reached");
++        Check.True(PoolAccess.Data(draw.State) != null, "Successful nonzero preparation must borrow a payload");
++        fixture.AssertCursors(1 << 1);
++    }
++
++    private enum Failure { Lookup, Preparation, BeforeCallback, PartialSubmission, AllSubmitted, Original }
++
++    private static void FailureReset(Failure phase)
++    {
++        var fixture = new Fixture(AllLayers, Enumerable.Range(1, 10).ToArray());
++        var failure = new InvalidOperationException($"Payload cleanup test: {phase}");
++        var before = PoolAccess.Available;
++        if (phase == Failure.Lookup) Plugin.LookupFailure = failure;
++        if (phase == Failure.Preparation) fixture.Native.PreparationFailure = failure;
++        if (phase is Failure.BeforeCallback or Failure.PartialSubmission or Failure.AllSubmitted)
++        {
++            fixture.Native.SubmissionFailure = failure;
++            fixture.Native.FailAfterCallbacks = phase == Failure.BeforeCallback ? 0 : phase == Failure.PartialSubmission ? 1 : 10;
++        }
++        var draw = PatchAccess.Begin(fixture.Segment);
++        var data = PoolAccess.Data(draw.State);
++        try
++        {
++            if (phase is Failure.Lookup or Failure.Preparation)
++            {
++                Check.True(data == null, "Failures before readiness must not borrow a payload");
++                Check.Same(before, PoolAccess.Available, "Unborrowed failure must preserve the available pool");
++            }
++            else
++            {
++                var mask = phase == Failure.BeforeCallback ? 0 : phase == Failure.PartialSubmission ? 2 : AllLayers;
++                Check.Equal(mask, PoolAccess.Field<int>(data, "Mask"), "Completed mask survives until finalization");
++                fixture.AssertCursors(mask);
++            }
++            if (phase == Failure.Original)
++                Check.Same(failure, Check.Throws<InvalidOperationException>(() =>
++                {
++                    try { throw failure; }
++                    finally { draw.Dispose(); }
++                }), "Original failure survives finalization");
++            else Check.Same(failure, Plugin.DisableCalls.Single(), "Exact optimization failure reaches disable");
++        }
++        finally { draw.Dispose(); }
++        PoolAccess.AssertReleased(draw.State, data);
++        if (data == null) Check.Same(before, PoolAccess.Available, "No payload returned for an unborrowed failure");
++        Plugin.Active = true;
++        Plugin.LookupFailure = null;
++        fixture.Native.PreparationFailure = fixture.Native.SubmissionFailure = null;
++        fixture.Native.SuccessfulLayers = [3];
++        using var next = PatchAccess.Begin(fixture.Segment);
++        if (data != null) Check.Same(data, PoolAccess.Data(next.State), "Post-exception draw reuses the cleared payload");
++        fixture.AssertCursors(1 << 3);
++    }
++
++    private static void OldFinalizer(bool nested)
++    {
++        var outerFixture = new Fixture(AllLayers, 4);
++        var fixture = new Fixture(AllLayers, 1);
++        using var outer = nested ? PatchAccess.Begin(outerFixture.Segment) : null;
++        var old = PatchAccess.Begin(fixture.Segment);
++        var data = PoolAccess.Data(old.State);
++        old.Dispose();
++        PoolAccess.AssertReleased(old.State, data);
++        fixture.Native.SuccessfulLayers = [2, 10];
++        using var later = PatchAccess.Begin(fixture.Segment);
++        Check.Same(data, PoolAccess.Data(later.State), "ABA precondition: later call borrows the exact old payload");
++        for (var repeat = 0; repeat < 3; repeat++)
++        {
++            PatchAccess.End(old.State);
++            Check.Same(later.State, PatchAccess.CurrentContext, "Old state must not retire a later borrower");
++            Check.Same(data, PoolAccess.Data(later.State), "Old state must not detach a later borrower's payload");
++            Check.True(!PoolAccess.Field<bool>(later.State, "Released"), "Later wrapper remains live");
++            fixture.AssertCursors((1 << 2) | (1 << 10));
++        }
++        Check.True(!ReferenceEquals(old.State, later.State), "ABA protection requires distinct finalizer state identity");
++    }
++
++    private static void OutOfOrder(bool bypass)
++    {
++        var fixture = new Fixture(AllLayers, 1, 10);
++        using var outer = PatchAccess.Begin(fixture.Segment);
++        var data = PoolAccess.Data(outer.State);
++        Plugin.Active = !bypass;
++        using (var inner = PatchAccess.Begin(fixture.Segment))
++        {
++            var available = PoolAccess.Available;
++            PatchAccess.End(outer.State);
++            Check.Same(inner.State, PatchAccess.CurrentContext, "Out-of-order outer finalizer must preserve the active inner context");
++            Check.Same(outer.State, PoolAccess.Field<object>(inner.State, "Previous"), "Inner predecessor remains intact");
++            Check.Same(data, PoolAccess.Data(outer.State), "Outer data remains borrowed until its matching finalizer");
++            Check.True(!PoolAccess.Field<bool>(outer.State, "Released"), "Out-of-order state must remain eligible for later matching cleanup");
++            Check.Same(available, PoolAccess.Available, "Out-of-order cleanup must not return an active payload");
++            fixture.AssertCursors(bypass ? 0 : (1 << 1) | (1 << 10));
++        }
++        Check.Same(outer.State, PatchAccess.CurrentContext, "Matching inner finalizer restores the outer state");
++        fixture.AssertCursors((1 << 1) | (1 << 10));
++        outer.Dispose();
++        PoolAccess.AssertReleased(outer.State, data);
++    }
++
++    private static void UnownedStates()
++    {
++        PatchAccess.End(null);
++        PatchAccess.End(default(int));
++        PatchAccess.End(new object());
++        PatchAccess.AssertClear();
++        var fixture = new Fixture(AllLayers, 1);
++        using var draw = PatchAccess.Begin(fixture.Segment);
++        var data = PoolAccess.Data(draw.State);
++        var available = PoolAccess.Available;
++        foreach (var state in new[] { null, new object(), 0, "foreign", Activator.CreateInstance(draw.State.GetType(), true) })
++        {
++            PatchAccess.End(state);
++            Check.Same(draw.State, PatchAccess.CurrentContext, "Default or unowned finalizer state must preserve active context");
++            Check.Same(data, PoolAccess.Data(draw.State), "Unowned state must preserve borrowed data");
++            Check.Same(available, PoolAccess.Available, "Unowned state must preserve the free pool");
++            fixture.AssertCursors(1 << 1);
++        }
++    }
++
++    private static void ThreadPoolIsolation()
++    {
++        var parent = new Fixture(AllLayers, 1);
++        var worker = new Fixture(AllLayers, 4);
++        var seed = PatchAccess.Begin(parent.Segment);
++        var mainData = PoolAccess.Data(seed.State);
++        seed.Dispose();
++        Check.Same(mainData, PoolAccess.Available, "Parent thread has a reusable payload before worker starts");
++        Plugin.Active = false;
++        using var foreign = PatchAccess.Begin(parent.Segment);
++        Plugin.Active = true;
++        object workerData = null;
++        Action<int> workerCallback = null;
++        Exception workerFailure = null;
++        var thread = new Thread(() =>
++        {
++            try
++            {
++                PatchAccess.AssertClear();
++                Check.True(PoolAccess.Available == null, "A fresh thread must not inherit another thread's free-list head");
++                var first = PatchAccess.Begin(worker.Segment);
++                workerData = PoolAccess.Data(first.State);
++                workerCallback = worker.Native.LastSubmitted;
++                try
++                {
++                    Check.True(!ReferenceEquals(mainData, workerData), "Worker cannot borrow the parent's payload");
++                    PatchAccess.End(foreign.State);
++                    Check.Same(first.State, PatchAccess.CurrentContext, "Foreign thread's finalizer state cannot pop a live context");
++                    worker.AssertCursors(1 << 4);
++                    parent.AssertCursors(0);
++                }
++                finally { first.Dispose(); }
++                PoolAccess.AssertReleased(first.State, workerData);
++                using (var second = PatchAccess.Begin(worker.Segment))
++                {
++                    Check.Same(workerData, PoolAccess.Data(second.State), "Worker reuses its own pool");
++                    Check.Same(workerCallback, worker.Native.LastSubmitted, "Worker reuses its own callback");
++                }
++                PoolAccess.AssertReset(workerData);
++                PatchAccess.AssertClear();
++            }
++            catch (Exception exception) { workerFailure = exception; }
++        });
++        thread.Start();
++        thread.Join();
++        if (workerFailure != null) throw new InvalidOperationException("Independent payload pool failure", workerFailure);
++        Check.Same(foreign.State, PatchAccess.CurrentContext, "Worker cannot change the parent's live context");
++        Check.True(!PoolAccess.Field<bool>(foreign.State, "Released"), "Foreign live state remains owned by the parent thread");
++        Check.Same(mainData, PoolAccess.Available, "Worker must not replace the parent thread's available payload");
++        using var next = PatchAccess.Begin(parent.Segment);
++        Check.Same(mainData, PoolAccess.Data(next.State), "Parent still borrows its own payload");
++        Check.True(!ReferenceEquals(workerCallback, parent.Native.LastSubmitted), "Each thread owns a distinct cached callback");
++        parent.AssertCursors(1 << 1);
++    }
++}
+diff --git a/tests/SphereOpt.RenderTests/Program.cs b/tests/SphereOpt.RenderTests/Program.cs
+index 5890af818af16e00bcdecd93dee7b8a0ab32befa..7e3baee79b1d364d88e266cbfab5480d480b06d2 100644
+--- a/tests/SphereOpt.RenderTests/Program.cs
++++ b/tests/SphereOpt.RenderTests/Program.cs
+@@ -10,13 +10,16 @@ internal static class Program
+ {
+     private static int Main(string[] args)
+     {
+-        if (args.Length != 0 && (args.Length != 2 || args[0] != "--captured-assembly"))
++        var allocationsOnly = args.Length == 1 && args[0] == "--allocations-only";
++        if (args.Length != 0 && !allocationsOnly && (args.Length != 2 || args[0] != "--captured-assembly"))
+         {
+-            Console.Error.WriteLine("Usage: SphereOpt.RenderTests [--captured-assembly <captured Assembly-CSharp.dll>]");
++            Console.Error.WriteLine("Usage: SphereOpt.RenderTests [--captured-assembly <captured Assembly-CSharp.dll> | --allocations-only]");
+             return 2;
+         }
+-        var tests = RenderContextTests.Cases().Concat(RewriterIntegrationTests.Cases())
+-            .Concat(args.Length == 0 ? [] : CapturedIlTests.Cases(args[1]))
++        var tests = (allocationsOnly ? AllocationTests.Cases() :
++            RenderContextTests.Cases().Concat(PooledContextTests.Cases()).Concat(AllocationTests.Cases())
++            .Concat(RewriterIntegrationTests.Cases())
++            .Concat(args.Length == 0 ? [] : CapturedIlTests.Cases(args[1])))
+             .Append(("Isolation/no game, plugin or Unity assembly loaded or referenced", (Action)AssertIsolated))
+             .ToArray();
+         var failed = 0;
+@@ -62,11 +65,18 @@ internal static class Program
+ 
+ internal static class PatchAccess
+ {
++    internal delegate bool PrefixCall(DysonSphereSegmentRenderer renderer, ERenderPlace place,
++        int editorMask, int gameMask, out object state);
++
+     private static readonly Type Patch = typeof(Patch_DysonSphereSegmentRenderer);
+     internal static readonly MethodInfo Prefix = Method("BeforeDraw");
+     internal static readonly MethodInfo CursorMethod = Method("RenderShellCursor");
+     internal static readonly MethodInfo Finalizer = Method("AfterDraw");
+     internal static readonly MethodInfo Transpiler = Method("DrawModels");
++    // Binding happens once, outside every measured region. Delegate calls do
++    // not allocate reflection argument arrays or boxed arguments/results.
++    internal static readonly PrefixCall DirectPrefix = Prefix.CreateDelegate<PrefixCall>();
++    internal static readonly Action<object> DirectFinalizer = Finalizer.CreateDelegate<Action<object>>();
+     private static readonly FieldInfo Current = Patch.GetField("current", BindingFlags.Static | BindingFlags.NonPublic)
+         ?? throw new InvalidOperationException("Production context field not found");
+ 
+diff --git a/tests/SphereOpt.RenderTests/README.md b/tests/SphereOpt.RenderTests/README.md
+index d2ddebd348e4ab757d8eb185ae08569e77a0bd4a..5228e6628151e24b0f4f591c0947a9bf55592190 100644
+--- a/tests/SphereOpt.RenderTests/README.md
++++ b/tests/SphereOpt.RenderTests/README.md
+@@ -8,7 +8,10 @@ dotnet run --project external/SphereOpt/tests/SphereOpt.RenderTests/SphereOpt.Re
+ 
+ The project links the actual `Patch_DysonSphereSegmentRenderer.cs` and
+ `ShellCursorRewriter.cs`. It invokes `BeforeDraw`, `RenderShellCursor`, and
+-`AfterDraw` through reflection. It does not copy their context implementation.
++`AfterDraw` through reflection for behavioral checks. Allocation measurements
++bind the actual prefix and finalizer once with `MethodInfo.CreateDelegate`.
++They execute cached, typed delegates without reflection argument arrays or
++boxing inside the measured loop. The harness does not copy the context implementation.
+ HarmonyX is locked to 2.5.5. The shared test `Directory.Build.props` puts
+ intermediate files and binaries under `.local/build/SphereOptTests/`, with a
+ separate directory for this project.
+@@ -19,6 +22,14 @@ cover successful callback timing, exact sphere/layer identities and recreation,
+ nested calls and bypassed nested calls, render-place/profiler/inactive guards,
+ missing player/game data, zero preparation masks, preparation/submission
+ failures, exception cleanup, repeated cleanup, and thread-local context isolation.
++Payload checks inspect the actual `DrawData` before and after finalization:
++sphere, all eleven layer slots, mask and retired wrapper links must clear.
++Sequential calls and two passes through three nesting levels require fresh
++wrappers and reuse of distinct payloads and cached submission callbacks. The
++sequential case also requires the same layer-array instance. Bypasses and
++lookup/preparation failures leave the free pool untouched. Tests repeat an old
++finalizer after a later call borrows the same payload, reject out-of-order and
++unowned finalizers, and independently check each thread's pool and callback.
+ A synthetic emitted method also runs the actual transpiler and getter together.
+ Guard precedence cases also combine bypasses with a missing sphere/player.
+ 
+@@ -59,8 +70,49 @@ Run the focused regression counterfactuals with:
+ py -3 external/SphereOpt/tests/SphereOpt.RenderTests/verify_counterfactuals.py
+ ```
+ 
+-The script generates three mutated patch copies under `.local/build`, uses
+-the same dependency lock, and requires each to reach failing harness assertions.
+-The mutations clear completed callbacks on failure, suppress prepared layers
+-before callbacks, or remove exact layer identity. Production files remain
+-unchanged. Full failure logs stay beside the generated projects.
++The script generates twelve mutated patch copies under
++`.local/build/SphereOptTests/RenderTests/counterfactuals`, uses the same dependency
++lock, and requires each to reach its named failing harness assertion and a
++completed test summary. Each mutation requires its exact assertion diagnostic
++in the named test's exception record; a leaked-context precheck or another
++test's failure cannot satisfy that gate. Compilation failures do not count.
++Each build must have exactly one summary reporting zero warnings and errors.
++Mutations clear completed callbacks on failure,
++suppress before callbacks, remove exact layer identity, retain each kind of
++payload state, pop an active inner context, share the pool across threads,
++allocate a submission wrapper, discard the pool tail, skip recycling after
++disable, or reuse finalizer wrappers to expose ABA. Full build and failure logs
++stay beside the generated projects. Production bytes are checked unchanged.
++
++Run the nine regression checks for these evidence gates with:
++
++```powershell
++py -3 external/SphereOpt/tests/SphereOpt.RenderTests/test_verification_gates.py
++```
++
++Measure the actual production prefix/finalizer against the prefix source at
++`7a566dd` without checking out or changing production:
++
++```powershell
++py -3 external/SphereOpt/tests/SphereOpt.RenderTests/verify_allocations.py
++```
++
++The script reads the historical source with `git show`, builds isolated copies
++of both versions with the same harness and lock, and runs them in separate
++processes. Five paths cover inactive, profiler, unsupported place, missing player,
++and zero prepared mask. Each path warms 20,000 calls, then measures 100,000 calls
++using `GC.GetAllocatedBytesForCurrentThread`. Fake event recording is disabled;
++counters verify the selected path was reached and no fake events were recorded.
++Fixtures, delegate binding, assertions, reflection and report serialization all
++run outside the measured loop. The measurement includes the unique per-call
++wrapper. It does not assume zero allocation or a particular object size.
++
++The comparison requires lower total allocated bytes on every path and matching
++runtime, architecture and iteration metadata. Its source hashes, raw samples,
++comparison JSON and build/run logs stay under
++`.local/build/SphereOptTests/RenderTests/allocations`. The allocation-only entrypoint
++is also available as `dotnet run ... -- --allocations-only`. Active rendering is
++covered by payload/array/callback identity checks rather than a GC budget. These
++are managed host measurements, not Unity Mono allocation, native rendering,
++frame-time or FPS measurements. Callbacks in the fake run synchronously inside
++`RenderShells`; delayed or asynchronous callbacks are outside this contract.
+diff --git a/tests/SphereOpt.RenderTests/RenderContextTests.cs b/tests/SphereOpt.RenderTests/RenderContextTests.cs
+index 177a7dffddf62dbf23a61c85d910636e95a9ea8e..260bfe9ed4f3442906f6678d5ff2687de2e8102c 100644
+--- a/tests/SphereOpt.RenderTests/RenderContextTests.cs
++++ b/tests/SphereOpt.RenderTests/RenderContextTests.cs
+@@ -340,6 +340,7 @@ internal static class RenderContextTests
+         var inner = new Fixture(AllLayers, 1, 10);
+         using var outerDraw = nested ? PatchAccess.Begin(outer.Segment) : null;
+         ConfigureBypass(inner, bypass, out var place);
++        var available = PoolAccess.Available;
+         try
+         {
+             using (var draw = PatchAccess.Begin(inner.Segment, place))
+@@ -347,6 +348,8 @@ internal static class RenderContextTests
+                 var skipsOriginal = bypass is Bypass.MissingSphere or Bypass.MissingGameData or Bypass.NullPlayer;
+                 Check.Equal(!skipsOriginal, draw.RunOriginal, "Original continuation for guard path");
+                 Check.True(!nested || !ReferenceEquals(outerDraw.State, draw.State), "Bypassed inner call needs fresh state");
++                Check.True(PoolAccess.Data(draw.State) == null, "Bypassed contexts must not borrow reusable payloads");
++                Check.Same(available, PoolAccess.Available, "Bypass must leave the available payload pool untouched");
+                 inner.AssertCursors(0);
+                 outer.AssertCursors(0);
+                 Check.Equal(bypass == Bypass.ZeroMask ? 1 : 0, inner.Native.PrepareCalls.Count, "Guard preparation count");
+@@ -355,6 +358,7 @@ internal static class RenderContextTests
+                     "Guard must not acquire a renderer before eligibility");
+                 Check.Equal(0, Plugin.DisableCalls.Count, "Guard must not be treated as an error");
+             }
++            Check.Same(available, PoolAccess.Available, "Unborrowed bypass finalization must leave the payload pool untouched");
+             if (nested)
+             {
+                 Check.Same(outerDraw.State, PatchAccess.CurrentContext, "Bypassed nested context must restore its predecessor");
+diff --git a/tests/SphereOpt.RenderTests/test_verification_gates.py b/tests/SphereOpt.RenderTests/test_verification_gates.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..28246ac34178d948c6fe0c53f1a76bb03093c965
+--- /dev/null
++++ b/tests/SphereOpt.RenderTests/test_verification_gates.py
+@@ -0,0 +1,56 @@
++"""Regression checks for the private build and mutant evidence gates."""
++
++import sys
++import unittest
++
++sys.dont_write_bytecode = True
++from verify_counterfactuals import assert_clean_build, targeted_failure
++
++
++class VerificationGates(unittest.TestCase):
++    def test_exact_zero_summary_passes(self):
++        assert_clean_build(0, "Build succeeded.\r\n    0 Warning(s)\r\n    0 Error(s)\r\n")
++
++    def test_nonzero_counts_cannot_match_a_zero_substring(self):
++        for warnings, errors in ((1, 0), (10, 0), (100, 0), (0, 1), (0, 10), (0, 100)):
++            with self.subTest(warnings=warnings, errors=errors), self.assertRaises(RuntimeError):
++                assert_clean_build(0, f"    {warnings} Warning(s)\n    {errors} Error(s)\n")
++
++    def test_missing_or_embedded_or_duplicate_summaries_fail(self):
++        for output in ("", "prefix 0 Warning(s)\n0 Error(s)\n", "0 Warning(s)\n",
++                       "0 Warning(s)\n0 Error(s)\n0 Warning(s)\n"):
++            with self.subTest(output=output), self.assertRaises(RuntimeError):
++                assert_clean_build(0, output)
++
++    def test_nonzero_build_exit_fails_even_with_zero_summary(self):
++        with self.assertRaises(RuntimeError):
++            assert_clean_build(1, "0 Warning(s)\n0 Error(s)\n")
++
++    def test_target_precheck_contamination_does_not_prove_assertion(self):
++        output = "FAIL Pool/target test: System.InvalidOperationException: Production draw context leaked past finalization\n"
++        self.assertIsNone(targeted_failure(output, "FAIL Pool/target ", "Expected assertion"))
++
++    def test_exact_assertion_matches_the_named_record(self):
++        output = "FAIL Pool/target test: System.InvalidOperationException: Expected assertion\r\n   at Check.True()\r\n"
++        self.assertEqual(output.splitlines()[0], targeted_failure(output, "FAIL Pool/target ", "Expected assertion"))
++
++    def test_inner_worker_assertion_matches(self):
++        output = ("FAIL Pool/target test: System.InvalidOperationException: Worker failure\n"
++                  " ---> System.InvalidOperationException: Expected assertion\n   at Worker()\n")
++        self.assertEqual(output.splitlines()[0], targeted_failure(output, "FAIL Pool/target ", "Expected assertion"))
++
++    def test_assertion_in_another_failure_cannot_validate_target(self):
++        output = ("FAIL Pool/target test: System.InvalidOperationException: Context leak\n"
++                  "FAIL Pool/other test: System.InvalidOperationException: Expected assertion\n")
++        self.assertIsNone(targeted_failure(output, "FAIL Pool/target ", "Expected assertion"))
++
++    def test_diagnostic_requires_exact_text_and_exception_origin(self):
++        for detail in ("Expected assertion plus extra text", "Unrelated failure\n   at Expected assertion",
++                       "Unrelated failure\nExpected assertion"):
++            with self.subTest(detail=detail):
++                output = f"FAIL Pool/target test: System.InvalidOperationException: {detail}\n"
++                self.assertIsNone(targeted_failure(output, "FAIL Pool/target ", "Expected assertion"))
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/SphereOpt.RenderTests/verify_allocations.py b/tests/SphereOpt.RenderTests/verify_allocations.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d9ee0dfe189267d50fb5af925dfdbc143328192
+--- /dev/null
++++ b/tests/SphereOpt.RenderTests/verify_allocations.py
+@@ -0,0 +1,67 @@
++"""Compare actual current and 7a566dd prefix/finalizer managed allocations.
++
++Both copies link the same harness and locked dependency, run in separate .NET
++processes and write only this harness's private .local/build output directory.
++No Unity Mono, native allocation, frame-time or FPS conclusion follows.
++"""
++
++import hashlib
++import json
++import subprocess
++import sys
++
++# Keep Python's generated import cache out of the source directory.
++sys.dont_write_bytecode = True
++from verify_counterfactuals import BUILD, PRODUCTION, private_project, run_project
++
++
++def main() -> None:
++    original = PRODUCTION.read_bytes()
++    revision = subprocess.run(
++        ["git", "rev-parse", "7a566dd^{commit}"], cwd=PRODUCTION.parent,
++        capture_output=True, text=True, check=True,
++    ).stdout.strip()
++    baseline = subprocess.run(
++        ["git", "show", f"{revision}:Patch_DysonSphereSegmentRenderer.cs"],
++        cwd=PRODUCTION.parent, capture_output=True, check=True,
++    ).stdout
++    results = {}
++    for name, source in (("current", original), ("baseline_7a566dd", baseline)):
++        print(f"ALLOCATION COMPARISON running {name}", flush=True)
++        project = private_project(BUILD / "allocations" / name, source.decode("utf-8"))
++        code, output = run_project(project, "--allocations-only")
++        if code != 0 or "RESULT total=6 passed=6 failed=0 skipped=0" not in output:
++            raise RuntimeError(f"{name}: allocation harness failed\n{output}")
++        samples = [json.loads(line.removeprefix("ALLOCATION "))
++                   for line in output.splitlines() if line.startswith("ALLOCATION ")]
++        if len(samples) != 5 or len({sample["path"] for sample in samples}) != 5:
++            raise RuntimeError(f"{name}: expected five distinct bypass measurements")
++        results[name] = {sample["path"]: sample for sample in samples}
++    comparisons = []
++    for path, current in results["current"].items():
++        old = results["baseline_7a566dd"][path]
++        for key in ("framework", "architecture", "iterations", "warmup", "managedHostOnly",
++                    "reflectionInMeasuredLoop", "fakeEvents"):
++            if current[key] != old[key]:
++                raise RuntimeError(f"{path}: incomparable measurements: {key}")
++        if current["bytes"] >= old["bytes"]:
++            raise RuntimeError(f"{path}: current prefix did not reduce measured managed allocations")
++        comparison = dict(path=path, iterations=current["iterations"],
++                          currentBytes=current["bytes"], baselineBytes=old["bytes"],
++                          currentBytesPerCall=current["bytesPerCall"], baselineBytesPerCall=old["bytesPerCall"],
++                          savedBytesPerCall=old["bytesPerCall"] - current["bytesPerCall"])
++        comparisons.append(comparison)
++        print("ALLOCATION COMPARISON " + json.dumps(comparison, sort_keys=True), flush=True)
++    if PRODUCTION.read_bytes() != original:
++        raise RuntimeError("Production source changed during allocation comparison")
++    report = dict(baselineRevision=revision, currentSourceSha256=hashlib.sha256(original).hexdigest(),
++                  baselineSourceSha256=hashlib.sha256(baseline).hexdigest(),
++                  managedHostOnly=True, productionUnchanged=True, measurements=results, comparisons=comparisons)
++    destination = BUILD / "allocations" / "comparison.json"
++    destination.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
++    print(f"ALLOCATION COMPARISON RESULT paths={len(comparisons)} reduced={len(comparisons)} "
++          "warnings=0 errors=0 productionUnchanged=true", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/SphereOpt.RenderTests/verify_counterfactuals.py b/tests/SphereOpt.RenderTests/verify_counterfactuals.py
+index f87e1df94e91a33b68ddb5295df34829d985403c..64fb1dc40bf98eef932f7eb7b151014ed3739a21 100644
+--- a/tests/SphereOpt.RenderTests/verify_counterfactuals.py
++++ b/tests/SphereOpt.RenderTests/verify_counterfactuals.py
+@@ -1,78 +1,156 @@
+-"""Prove selected render-patch regressions fail without editing production.
++"""Require assertion failures from isolated render-patch mutants.
+ 
+-All generated sources and projects stay under the workspace's .local/build.
+-Run with: py -3 external/SphereOpt/tests/SphereOpt.RenderTests/verify_counterfactuals.py
++Generated projects/logs stay in this harness's private .local/build area.
++Production, Git, dependency declarations and package locks remain unchanged.
+ """
+ 
+ from pathlib import Path
++import hashlib
++import re
+ import subprocess
+ from xml.sax.saxutils import quoteattr
+ 
+ 
++TESTS = Path(__file__).resolve().parent
++ROOT = TESTS.parents[3]
++PRODUCTION = TESTS.parents[1] / "Patch_DysonSphereSegmentRenderer.cs"
++BUILD = ROOT / ".local/build/SphereOptTests/RenderTests"
++
++
++def assert_clean_build(code: int, output: str) -> None:
++    warnings = re.findall(r"^[ \t]*([0-9]+) Warning\(s\)[ \t]*\r?$", output, re.MULTILINE)
++    errors = re.findall(r"^[ \t]*([0-9]+) Error\(s\)[ \t]*\r?$", output, re.MULTILINE)
++    if code != 0 or warnings != ["0"] or errors != ["0"]:
++        raise RuntimeError(f"Private harness must build with zero warnings/errors\n{output}")
++
++
++def targeted_failure(output: str, failure_prefix: str, assertion: str) -> str | None:
++    # A context precheck failure uses the test's name too. Require the exact
++    # assertion diagnostic in that test's own exception record. Worker-thread
++    # assertions appear as inner exceptions, so retain those diagnostic lines.
++    for record in re.split(r"(?=^(?:FAIL |PASS |RESULT |ALLOCATION ))", output, flags=re.MULTILINE):
++        lines = record.splitlines()
++        if not lines or not lines[0].startswith(failure_prefix):
++            continue
++        diagnostics = [lines[0].partition(": System.InvalidOperationException: ")[2]]
++        diagnostics.extend(line.removeprefix(" ---> System.InvalidOperationException: ")
++                           for line in lines[1:] if line.startswith(" ---> System.InvalidOperationException: "))
++        if assertion in diagnostics:
++            return lines[0]
++    return None
++
++
++def private_project(destination: Path, source: str) -> Path:
++    destination.mkdir(parents=True, exist_ok=True)
++    (destination / "PrivatePatch.cs").write_bytes(source.encode("utf-8"))
++    (destination / "packages.lock.json").write_bytes((TESTS / "packages.lock.json").read_bytes())
++    includes = "".join(f"<Compile Include={quoteattr(str(path))} />" for path in sorted(TESTS.glob("*.cs")))
++    rewriter = quoteattr(str(PRODUCTION.with_name("ShellCursorRewriter.cs")))
++    project = (
++        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType>'
++        '<TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings>'
++        '<Nullable>disable</Nullable><NuGetAudit>false</NuGetAudit>'
++        '<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>'
++        '<RestoreLockedMode>true</RestoreLockedMode></PropertyGroup><ItemGroup>'
++        '<PackageReference Include="HarmonyX" Version="[2.5.5]" />'
++        f"{includes}<Compile Include={rewriter} /></ItemGroup></Project>"
++    )
++    project_path = destination / "PrivateRenderTests.csproj"
++    project_path.write_text(project, encoding="utf-8")
++    return project_path
++
++
++def run_project(project: Path, *args: str) -> tuple[int, str]:
++    built = subprocess.run(
++        ["dotnet", "build", str(project), "--configuration", "Release", "--nologo"],
++        cwd=ROOT, capture_output=True, text=True, check=False,
++    )
++    build_output = built.stdout + built.stderr
++    (project.parent / "build.log").write_text(build_output, encoding="utf-8")
++    assert_clean_build(built.returncode, build_output)
++    result = subprocess.run(
++        ["dotnet", "run", "--project", str(project), "--configuration", "Release", "--no-build", "--", *args],
++        cwd=ROOT, capture_output=True, text=True, check=False,
++    )
++    output = result.stdout + result.stderr
++    (project.parent / "result.log").write_text(output, encoding="utf-8")
++    return result.returncode, output
++
++
+ def main() -> None:
+-    tests = Path(__file__).resolve().parent
+-    root = tests.parents[3]
+-    production = tests.parents[1] / "Patch_DysonSphereSegmentRenderer.cs"
+-    source = production.read_text(encoding="utf-8")
+-    build = root / ".local/build/SphereOptTests/counterfactuals/RenderTests"
++    original = PRODUCTION.read_bytes()
++    source = original.decode("utf-8")
++    # A compile failure never counts as a rejected mutant: require the named
++    # behavior's executed assertion failure and a completed harness summary.
+     mutations = {
+-        "clear_completed_mask_on_failure": (
+-            "catch (Exception exception) { SphereOpt.Disable(exception); }",
+-            "catch (Exception exception) { context.Mask = 0; SphereOpt.Disable(exception); }",
+-            "FAIL Failure/submission after layer 1 ",
+-        ),
+-        "suppress_prepared_before_callbacks": (
+-            "context.Sphere = sphere;",
+-            "context.Sphere = sphere; context.Mask = mask; "
+-            "for (var i = 1; i <= 10; i++) context.Layers[i] = sphere.layersIdBased[i];",
+-            "FAIL Masks/all 59,049 ",
+-        ),
+-        "drop_exact_layer_identity": (
+-            "ReferenceEquals(current.Layers[layer.id], layer)",
+-            "true",
+-            "FAIL Identity/recreated layer ",
+-        ),
++        "clear_completed_mask_on_failure": ([
++            ("catch (Exception exception) { SphereOpt.Disable(exception); }",
++             "catch (Exception exception) { if (context.Data != null) context.Data.Mask = 0; SphereOpt.Disable(exception); }")
++        ], "FAIL Failure/submission after layer 1 ", "Suppression mask=0x2, layer=1: expected 1, got 21"),
++        "suppress_prepared_before_callbacks": ([
++            ("data.Sphere = sphere;", "data.Sphere = sphere; data.Mask = mask; "
++             "for (var i = 1; i <= 10; i++) data.Layers[i] = sphere.layersIdBased[i];")
++        ], "FAIL Masks/all 59,049 ", "Suppression mask=0x0, layer=1: expected 21, got 1"),
++        "drop_exact_layer_identity": ([
++            ("ReferenceEquals(data.Layers[layer.id], layer)", "true")
++        ], "FAIL Identity/recreated layer ", "Recreated layer must not inherit an old callback: expected 24, got 1"),
++        "retain_sphere_reference": ([
++            ("Sphere = null;", "// mutant retains Sphere")
++        ], "FAIL Pool/success ", "Returned payload retains a sphere"),
++        "retain_submitted_mask": ([
++            ("Mask = 0;", "// mutant retains Mask")
++        ], "FAIL Pool/success ", "Returned payload retains submitted mask bits: expected 0, got 2046"),
++        "retain_layer_references": ([
++            ("Array.Clear(Layers, 0, Layers.Length);", "// mutant retains Layers")
++        ], "FAIL Pool/success ", "Returned payload retains layer references"),
++        "pop_out_of_order_context": ([
++            (" || !ReferenceEquals(current, context)", "")
++        ], "FAIL Finalizer/out-of-order outer state cannot pop an active ",
++         "Out-of-order outer finalizer must preserve the active inner context"),
++        "share_payload_pool_across_threads": ([
++            ("[ThreadStatic] private static DrawData available;", "private static DrawData available;")
++        ], "FAIL ThreadStatic/payload pool ", "A fresh thread must not inherit another thread's free-list head"),
++        "allocate_submission_wrapper": ([
++            ("renderer.RenderShells(place, editorMask, gameMask, data.Submitted);",
++             "renderer.RenderShells(place, editorMask, gameMask, id => data.Submitted(id));")
++        ], "FAIL Pool/sequential draws ", "Cached submission delegate identity must be reused"),
++        "discard_available_tail": ([
++            ("available = data.Next;", "available = null;")
++        ], "FAIL Pool/nested peak ", "Repeated peak nesting must reuse each returned payload"),
++        "skip_recycling_after_disable": ([
++            ("if (data == null) return;", "if (data == null || !SphereOpt.Active) return;")
++        ], "FAIL Pool/PartialSubmission ", "Returned payload retains a sphere"),
++        "reuse_finalizer_wrapper_aba": ([
++            ("[ThreadStatic] private static DrawContext current;",
++             "[ThreadStatic] private static DrawContext current; [ThreadStatic] private static DrawContext reusable;"),
++            ("var context = new DrawContext { Previous = current };",
++             "var context = reusable ?? new DrawContext(); reusable = null; context.Previous = current; context.Released = false;"),
++            ("context.Released = true;", "context.Released = true; reusable = context;")
++        ], "FAIL Pool/old top-level finalizer ", "Old state must not retire a later borrower"),
+     }
+-    for name, (old, new, required_failure) in mutations.items():
+-        if source.count(old) != 1:
+-            raise RuntimeError(f"{name}: mutation anchor must occur exactly once")
+-        destination = build / name
+-        destination.mkdir(parents=True, exist_ok=True)
+-        (destination / "MutatedPatch.cs").write_text(source.replace(old, new), encoding="utf-8")
+-        (destination / "packages.lock.json").write_bytes((tests / "packages.lock.json").read_bytes())
+-        includes = "".join(f"<Compile Include={quoteattr(str(path))} />" for path in sorted(tests.glob("*.cs")))
+-        rewriter = quoteattr(str(production.with_name("ShellCursorRewriter.cs")))
+-        project = (
+-            '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType>'
+-            '<TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings>'
+-            '<Nullable>disable</Nullable><NuGetAudit>false</NuGetAudit>'
+-            '<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>'
+-            '<RestoreLockedMode>true</RestoreLockedMode></PropertyGroup><ItemGroup>'
+-            '<PackageReference Include="HarmonyX" Version="[2.5.5]" />'
+-            f"{includes}<Compile Include={rewriter} /></ItemGroup></Project>"
+-        )
+-        project_path = destination / "Counterfactual.csproj"
+-        project_path.write_text(project, encoding="utf-8")
++    for name, (replacements, required_failure, required_assertion) in mutations.items():
++        mutated = source
++        for old, new in replacements:
++            if mutated.count(old) != 1:
++                raise RuntimeError(f"{name}: mutation anchor must occur exactly once: {old}")
++            mutated = mutated.replace(old, new)
+         print(f"COUNTERFACTUAL running {name}", flush=True)
+-        result = subprocess.run(
+-            ["dotnet", "run", "--project", str(project_path), "--configuration", "Release"],
+-            cwd=root,
+-            capture_output=True,
+-            text=True,
+-            check=False,
+-        )
+-        output = result.stdout + result.stderr
+-        (destination / "result.log").write_text(output, encoding="utf-8")
+-        failures = [line for line in output.splitlines() if line.startswith("FAIL ")]
++        project = private_project(BUILD / "counterfactuals" / name, mutated)
++        code, output = run_project(project)
+         summaries = [line for line in output.splitlines() if line.startswith("RESULT ")]
+-        rejected = result.returncode != 0 and bool(summaries) and any(
+-            line.startswith(required_failure) for line in failures
+-        )
+-        print(f"COUNTERFACTUAL {name} exit={result.returncode} rejected={rejected}", flush=True)
+-        for line in summaries + failures[:3]:
++        failure = targeted_failure(output, required_failure, required_assertion)
++        rejected = code != 0 and bool(summaries) and failure is not None
++        print(f"COUNTERFACTUAL {name} exit={code} rejected={rejected} warnings=0 errors=0", flush=True)
++        for line in summaries + ([failure] if failure else []):
+             print(line, flush=True)
++        if failure:
++            print(f"ASSERTION {required_assertion}", flush=True)
+         if not rejected:
+-            raise RuntimeError(f"{name}: mutant did not reach failing assertions\n{output[-6000:]}")
++            raise RuntimeError(f"{name}: mutant did not reach its failing assertion\n{output[-6000:]}")
++    if PRODUCTION.read_bytes() != original:
++        raise RuntimeError("Production source changed during the counterfactual run")
++    print(f"COUNTERFACTUAL RESULT rejected={len(mutations)} total={len(mutations)} "
++          f"productionUnchanged=true sha256={hashlib.sha256(original).hexdigest()}", flush=True)
+ 
+ 
+ if __name__ == "__main__":
 -- 
 2.51.0.windows.1
 

@@ -4,13 +4,20 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>disable</Nullable>
+    <Optimize>true</Optimize>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode Condition="Exists('$(MSBuildProjectDirectory)/packages.lock.json')">true</RestoreLockedMode>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Keep earlier in-project generated sources excluded when outputs move to .local. -->
+    <Compile Remove="bin/**;obj/**" />
     <PackageReference Include="HarmonyX" Version="[2.5.5]" />
     <PackageReference Include="Mono.Cecil" Version="[0.11.6]" />
     <Compile Include="../../external/SphereOpt/ShellCursorRewriter.cs" Link="Production/ShellCursorRewriter.cs" />
     <Compile Include="../../external/SphereOpt/ColorStoreRewriter.cs" Link="Production/ColorStoreRewriter.cs" />
+    <EmbeddedResource Include="../../external/SphereOpt/ShellCursorRewriter.cs" LogicalName="ProofSource.ShellCursorRewriter.cs" />
+    <EmbeddedResource Include="../../external/SphereOpt/ColorStoreRewriter.cs" LogicalName="ProofSource.ColorStoreRewriter.cs" />
+    <EmbeddedResource Include="DspTransformations.cs" LogicalName="ProofSource.DspTransformations.cs" />
+    <None Update="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

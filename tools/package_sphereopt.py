@@ -36,8 +36,12 @@ def archive(files: dict[str, bytes]) -> bytes:
 def main() -> None:
     if command("git", "status", "--porcelain", "--untracked-files=all", cwd=CLONE):
         raise ValueError("Commit reviewed SphereOpt changes before packaging.")
+    source = command("git", "rev-parse", "HEAD", cwd=CLONE)
     subprocess.run([sys.executable, str(ROOT / "tools/game_snapshot.py"), "verify"], cwd=ROOT, check=True)
-    subprocess.run(["dotnet", "build", "tools/SphereOpt.OfflineBuild", "-c", "Release", "--no-restore", "-v", "minimal"], cwd=ROOT, check=True)
+    # The build project lives in the outer workspace. Its documentation commits
+    # must not become this independent mod's assembly informational revision.
+    subprocess.run(["dotnet", "build", "tools/SphereOpt.OfflineBuild", "-c", "Release", "--no-restore", "-v", "minimal",
+                    "-p:SourceRevisionId=" + source], cwd=ROOT, check=True)
     dll = ROOT / ".local/build/SphereOpt/SphereOpt.dll"
     subprocess.run([sys.executable, str(ROOT / "tools/game_snapshot.py"), "check-mod", str(dll)], cwd=ROOT, check=True)
     compatibility = json.loads((ROOT / ".local/compatibility.json").read_text(encoding="utf-8"))
@@ -61,12 +65,12 @@ def main() -> None:
     vendor = (CLONE / "thirdparty/UnityMeshSimplifier/Runtime/MeshSimplifier.cs").read_text(encoding="utf-8-sig")
     # Retain the complete supplied copyright/permission and original-author region.
     files["THIRD_PARTY_NOTICES.txt"] = vendor[:vendor.index("#if UNITY_2018")].encode("utf-8")
-    source = command("git", "rev-parse", "HEAD", cwd=CLONE)
-    if command("git", "status", "--porcelain", "--untracked-files=all", cwd=CLONE):
+    if (command("git", "status", "--porcelain", "--untracked-files=all", cwd=CLONE)
+            or command("git", "rev-parse", "HEAD", cwd=CLONE) != source):
         raise ValueError("Source changed while packaging.")
     latest = json.loads((ROOT / ".local/latest.json").read_text(encoding="utf-8"))
     provenance = {
-        "source_commit": source, "snapshot_id": latest["id"],
+        "source_commit": source, "build_source_revision": source, "snapshot_id": latest["id"],
         "version": manifest["version_number"], "plugin": identity, "unofficial": True,
         "files": {name: {"bytes": len(data), "sha256": digest(data)} for name, data in sorted(files.items())},
         "validation": {"references": compatibility["CheckedReferences"],

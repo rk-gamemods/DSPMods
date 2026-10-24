@@ -8,12 +8,14 @@ The four mods have complementary work, but their gains are not independent
 multipliers. Weaver already owns broad factory simulation and scheduling work.
 DSPOptimizations still contributes vanilla node/frame synchronization and other
 targeted changes. BuildToolOpt mainly addresses construction and blueprint
-operations. SphereOpt's shell batching, repeated render-state reconciliation and
-proposed partial shell-buffer uploads remain a distinct area to improve.
+operations. SphereOpt's shell batching, render-state reconciliation and
+partial shell-buffer uploads address a distinct part of the rendering work.
 
-Compatibility for our modified SphereOpt needs additional proof: this review
-identified a paint-transpiler ordering hazard with DSPOptimizations. The earlier
-SphereOpt offline acceptance did not test this combined stack.
+This review identified a paint-transpiler ordering hazard with the initial
+7a566dd SphereOpt candidate. The subsequent
+[CPU/compatibility follow-up](SPHEREOPT_CPU_UPDATE.md) adds the ordering contract
+and portable combined checks. The original evidence below is retained as the
+negative control; no live full-stack certification is implied.
 
 ## Installed inputs and source pins
 
@@ -235,10 +237,11 @@ and establish mutation/thread ordering; a hook inside a skipped vanilla body
 can miss changes. Broader caching must retain current identity checks and
 fallback until invalidation coverage is demonstrated.
 
-The next implementation order is therefore: establish paint/draw composition,
+That finding set the implementation order: establish paint/draw composition,
 then reduce repeated SphereOpt CPU lookups/calculations/allocations, then add
 bounded progress/appearance uploads with full-upload fallback for replacement,
-compaction and retries. Keep allocation policy and culling unchanged.
+compaction and retries. The [follow-up](SPHEREOPT_CPU_UPDATE.md) records those
+changes. Allocation policy and culling stay unchanged.
 
 ## Validation and limits
 

@@ -13,11 +13,12 @@ passes the offline acceptance checks below, and is expected to operate with the
 assessed current-game assemblies on Direct3D 11. No game files have been changed
 or game process run; in-game appearance and performance remain unverified.
 
-The subsequent [installed-stack review](OPTIMIZATION_STACK.md) identifies a
-paint-transpiler ordering hazard with DSPOptimizations 1.1.19. The acceptance
-record below covers the candidate's isolated offline contracts, not compatibility
-with that combined stack. Resolve composition before treating the candidate as
-validated for those installed mods.
+The subsequent [installed-stack review](OPTIMIZATION_STACK.md) identified a
+paint-transpiler ordering hazard with DSPOptimizations 1.1.19. The latest
+[CPU and compatibility follow-up](SPHEREOPT_CPU_UPDATE.md) adds a named ordering
+dependency and compiled-candidate/combined-IL checks. The validation record below
+is the initial 7a566dd candidate's history; it does not certify live full-stack
+Harmony installation.
 
 ## Scope and evidence
 
@@ -36,14 +37,14 @@ The SphereOpt baseline is commit
 `a06ca9a7bd53d907bea6160eec333b8b30336574`. Its complete inventory includes
 33 C# files and 15 shader/include/compute files. All implementation and project
 text was indexed separately; shader text uses an approximate parsing grammar.
-Binary artifacts have hash catalogs. The final candidate index covers all
+Binary artifacts have hash catalogs. The initial 7a566dd candidate index covers all
 122 tracked files: 118 text files and four binaries. Its 73 implementation
 files comprise 57 C#, 15 shader/include/compute files and one Python tool.
 JCodeMunch contains 106 files and 1,456 symbols; full-text indexing contains
 119 documents, including the binary catalog. All 238 sections and 119 full
 bodies were retrieved, with 947,865 bytes independently hash-verified.
 
-The final indexes are `andyoneal/SphereOpt` at local candidate HEAD
+The initial indexes were `andyoneal/SphereOpt` at local candidate HEAD
 `7a566ddad93ab58529c02fa3778d929eb747aa85`, and
 `local/SphereOpt-fulltext-7a566ddad93a`. The code identifier derives from the
 retained upstream remote; its indexed content is this local candidate, not a
@@ -235,14 +236,15 @@ an Editor rebuild requires new artifact verification and an updated identity.
 Recovered compiler inputs/includes and detailed native build evidence remain
 local. Existing shell normal/tangent lighting approximations remain unchanged.
 
-## Validation record
+## Initial candidate validation record
 
 The reviewed mod commit is `7a566ddad93ab58529c02fa3778d929eb747aa85`, tree
 `0312adaa128aae37021789978e32a9534b13ffa9`, on `rk/current-game-compat`.
-Its owning clone is clean. The workspace publishes its complete source delta in
-[SphereOpt-current-game.patch](../patches/SphereOpt-current-game.patch), including
-tests and repaired mod assets. Applying it to the pinned baseline reconstructs
-that exact Git tree. No hosted SphereOpt fork or public binary release was made.
+That historical tree remains available in the independent clone. The workspace's
+[SphereOpt-current-game.patch](../patches/SphereOpt-current-game.patch) now follows
+the latest candidate recorded in [sources.json](../sources.json), including tests
+and repaired mod assets. Patch replay verifies that latest tree. No hosted
+SphereOpt fork or public binary release was made.
 
 | Check | Result |
 | --- | --- |
@@ -286,39 +288,19 @@ Those limits apply even when all build and contract checks pass.
 ## Next optimization priorities
 
 The [stack review](OPTIMIZATION_STACK.md#combined-patch-risks-to-resolve-first)
-adds combined paint/draw patch validation ahead of this proposed CPU work.
+added combined paint/draw patch validation ahead of this CPU work. The
+[follow-up report](SPHEREOPT_CPU_UPDATE.md) records the implemented changes.
 Weaver already owns simulation scheduling and Dyson power optimizations;
 DSPOptimizations owns vanilla node/frame buffer synchronization. Keep the next
 SphereOpt changes within its own shell rendering and buffer state.
 
 On 2026-10-24, the user prioritized CPU overhead reduction and requested that
-visibility culling be logged for a later, more ambitious project. These are
-follow-up proposals; the assessed mod and its validation record above are
-unchanged. The target is rendering CPU time. This can also improve factory
-simulation throughput when rendering competes for CPU time, cache or memory
-bandwidth, even without changing simulation algorithms. Whether UPS improves
-depends on the actual bottleneck and needs measurement.
-
-The first CPU changes should reduce repeated allocation lookups and progress
-calculations in shell reconciliation while preserving the current eligibility
-decisions and vanilla fallback. Broader structural caching needs demonstrated
-invalidation coverage, including changes made by other mods. Diagnostics must
-confirm that batching is active: the current render guard bypasses it when
-`PerformanceMonitor.GpuProfilerOn` is true.
-
-Changed-range uploads are the next bounded proposal. Start with progress and
-shell appearance buffers, whose individual writes currently dirty whole arrays.
-Unity 2022.3 provides an
-[offset/count SetData overload](https://docs.unity3d.com/2022.3/Documentation/ScriptReference/ComputeBuffer.SetData.html).
-Track and combine dirty intervals, with full uploads after buffer replacement
-or pool compaction and when fragmented changes make small submissions costly.
-Audit direct array writes and public dirty flags so no update can be omitted.
-Keep public dirty flags as independent force-full-upload signals; a precise
-pending range must not hide a simultaneous untracked write marked by that flag.
-Retain pending changes after a failed upload. Tests should compare the resulting
-buffer contents against full uploads through edits, growth, removals and retries.
-This proposal needs no shader or allocation-policy change; actual driver cost
-and frame-time benefit still require native measurements.
+visibility culling be logged for a later project. Shell reconciliation and
+changed-range progress/appearance uploads are now implemented, with current
+contracts, evidence and limits owned by the follow-up report. Broader structural
+eligibility caching still needs demonstrated invalidation coverage, including
+changes made by other mods. Diagnostics must confirm batching is active:
+`PerformanceMonitor.GpuProfilerOn` currently selects vanilla rendering.
 
 GPU capacity reuse is deferred from this first pass. It is feasible, but its
 safety depends on keeping live draw counts separate from capacity, initializing

@@ -17,17 +17,24 @@ internal sealed class CapturedMethod
     private readonly MethodDefinition method;
     private readonly FieldDefinition target;
     private readonly FieldInfo fixture;
+    private readonly (MethodDefinition Target, MethodInfo Fixture)[] methodFixtures;
     private readonly CecilInstruction[] raw;
     private readonly Func<bool>[] rawChecks;
     private readonly Snapshot[] before;
     private readonly int labelCount;
     internal List<CodeInstruction> Input { get; }
 
-    internal CapturedMethod(MethodDefinition method, FieldDefinition target, FieldInfo fixture)
+    internal CapturedMethod(MethodDefinition method, FieldDefinition target, FieldInfo fixture,
+        params (MethodDefinition Target, MethodInfo Fixture)[] methodFixtures)
     {
         this.method = method;
         this.target = target;
         this.fixture = fixture;
+        this.methodFixtures = methodFixtures;
+        Check.That(methodFixtures.All(pair => !pair.Target.IsStatic && !pair.Fixture.IsStatic &&
+            pair.Target.ReturnType.FullName == "System.Void" && pair.Fixture.ReturnType == typeof(void) &&
+            pair.Target.Parameters.Count == 0 && pair.Fixture.GetParameters().Length == 0),
+            "Only validated parameterless instance-void method adapters are supported");
         var body = method.Body;
         raw = body.Instructions.ToArray();
         var rawState = raw.Select(i => (i.OpCode, i.Operand, i.Offset, i.Previous, i.Next,
@@ -75,11 +82,17 @@ internal sealed class CapturedMethod
         before = Input.Select(Snapshot.Take).ToArray();
         for (var index = 0; index < raw.Length; index++)
             Check.That(Input[index].opcode.Value == raw[index].OpCode.Value &&
-                ReferenceEquals(Input[index].operand, Check.Matches(raw[index].Operand, target) ? fixture : raw[index].Operand),
+                ReferenceEquals(Input[index].operand, MapOperand(raw[index].Operand)),
                 "Cecil adapter changed an opcode or a non-target operand identity");
     }
 
-    internal object MapOperand(object operand) => Check.Matches(operand, target) ? fixture : operand;
+    internal object MapOperand(object operand)
+    {
+        if (Check.Matches(operand, target)) return fixture;
+        foreach (var pair in methodFixtures)
+            if (Check.Matches(operand, pair.Target)) return pair.Fixture;
+        return operand;
+    }
 
     private void MapFinallyRegions()
     {
@@ -149,6 +162,12 @@ internal sealed class CapturedMethod
 
     internal void AssertRawUnchanged() => Check.That(rawChecks.All(check => check()), "Raw captured body, locals or EH metadata changed");
 
+    internal void AssertInputUnchanged()
+    {
+        VerifyClone(Input, Clone(Input).ToArray(), Array.Empty<int>(), null, before);
+        AssertRawUnchanged();
+    }
+
     internal object Report(int[] indices) => new
     {
         method = method.DeclaringType.FullName + "." + method.Name,
@@ -156,6 +175,7 @@ internal sealed class CapturedMethod
         locals = method.Body.Variables.Count, exceptionRegions = method.Body.ExceptionHandlers.Count,
         exceptionBoundaryBlocks = Input.Sum(i => i.blocks.Count), realBranchLabels = labelCount,
         targetFieldReferencesAdapted = raw.Count(i => Check.Matches(i.Operand, target)),
+        targetMethodReferencesAdapted = raw.Count(i => methodFixtures.Any(pair => Check.Matches(i.Operand, pair.Target))),
         substitutionOffsets = indices.Select(i => $"0x{raw[i].Offset:x4}").ToArray(),
         allOtherInstructionsAndMetadataPreserved = true, rawBodyAndLocalsUnchanged = true
     };
