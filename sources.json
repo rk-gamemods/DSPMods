@@ -1,0 +1,8 @@
+{
+  "SphereOpt": {
+    "url": "https://github.com/andyoneal/SphereOpt.git",
+    "path": "external/SphereOpt",
+    "reviewed_commit": "a06ca9a7bd53d907bea6160eec333b8b30336574",
+    "license": "Unlicense; vendored UnityMeshSimplifier retains MIT notices"
+  }
+}

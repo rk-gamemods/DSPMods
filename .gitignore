@@ -1,0 +1,10 @@
+.local/
+external/
+GamePaths.local.props
+**/bin/
+**/obj/
+**/__pycache__/
+*.dll
+*.pdb
+*.exe
+*.nupkg

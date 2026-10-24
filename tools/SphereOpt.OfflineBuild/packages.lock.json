@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "dependencies": {
+    ".NETFramework,Version=v4.7.2": {
+      "BepInEx.Core": {
+        "type": "Direct",
+        "requested": "[5.4.17, )",
+        "resolved": "5.4.17",
+        "contentHash": "f0UCf6tZxdhPrcHAgj/wQNz5V9RAAV0elgvgaFl8wFjaEdiKLxepkxdV0Y8Xuprm+AVrQUGcaSIhTBQvpRzk+g==",
+        "dependencies": {
+          "BepInEx.BaseLib": "5.4.17",
+          "HarmonyX": "2.5.5"
+        }
+      },
+      "BepInEx.PluginInfoProps": {
+        "type": "Direct",
+        "requested": "[1.*, )",
+        "resolved": "1.1.0",
+        "contentHash": "RqM3aaGs8Hc2m0D+8aSt9mv09rCMYNIF35NB3D6KA2zSpcXJh/9ZVWrPlIUJfA8KYzodSWcCMUexEW24fjwR3w=="
+      },
+      "Microsoft.NETFramework.ReferenceAssemblies": {
+        "type": "Direct",
+        "requested": "[1.0.3, )",
+        "resolved": "1.0.3",
+        "contentHash": "vUc9Npcs14QsyOD01tnv/m8sQUnGTGOw1BCmKcv77LBJY7OxhJ+zJF7UD/sCL3lYNFuqmQEVlkfS4Quif6FyYg==",
+        "dependencies": {
+          "Microsoft.NETFramework.ReferenceAssemblies.net472": "1.0.3"
+        }
+      },
+      "BepInEx.BaseLib": {
+        "type": "Transitive",
+        "resolved": "5.4.17",
+        "contentHash": "92N4BKDiF9KO8kXbY2+zp7dHNXZP3WBKhzw7U8orcYncutD7peHtuLfUdMW4PGY/d0SsoA5eOcBeklFuh7OS8A=="
+      },
+      "HarmonyX": {
+        "type": "Transitive",
+        "resolved": "2.5.5",
+        "contentHash": "sQTQhNCwbob8JnnLsJibcorfjQGi2ziseb8uIOtyWrIv/RrbH1bJiwwX6hyLHCrgLMbzBd5Z15SukTXlmfcYLQ==",
+        "dependencies": {
+          "MonoMod.RuntimeDetour": "21.8.19.1"
+        }
+      },
+      "Microsoft.NETFramework.ReferenceAssemblies.net472": {
+        "type": "Transitive",
+        "resolved": "1.0.3",
+        "contentHash": "0E7evZXHXaDYYiLRfpyXvCh+yzM2rNTyuZDI+ZO7UUqSc6GfjePiXTdqJGtgIKUwdI81tzQKmaWprnUiPj9hAw=="
+      },
+      "Mono.Cecil": {
+        "type": "Transitive",
+        "resolved": "0.11.4",
+        "contentHash": "IC1h5g0NeJGHIUgzM1P82ld57knhP0IcQfrYITDPXlNpMYGUrsG5TxuaWTjaeqDNQMBDNZkB8L0rBnwsY6JHuQ=="
+      },
+      "MonoMod.RuntimeDetour": {
+        "type": "Transitive",
+        "resolved": "21.8.19.1",
+        "contentHash": "fUEvDK4q9n+GAAB29vFKAsUIwhKAvZTVbn2WJemzLxbiTElutZ55ytUQxSSv6XhiRaJXrl5bSArO54PY0QNplw==",
+        "dependencies": {
+          "Mono.Cecil": "0.11.4",
+          "MonoMod.Utils": "21.8.19.1"
+        }
+      },
+      "MonoMod.Utils": {
+        "type": "Transitive",
+        "resolved": "21.8.19.1",
+        "contentHash": "HsH5TBMUdJmQtdINdYFG5a3BvCeGPezDX42qgv+h539drpNdD+qE7/NT6BtcmDI+y6VSVClFdnzcVNrOvTSfWQ==",
+        "dependencies": {
+          "Mono.Cecil": "0.11.4"
+        }
+      }
+    }
+  }
+}
