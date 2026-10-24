@@ -1,9 +1,9 @@
 # Dyson Sphere Program workspace
 
 This repository owns DSP analysis tools, validation contracts and research.
-The current task establishes the workspace and offline workflow. It does not
-authorize deploying mods, changing game files, launching DSP or changing
-SphereOpt's behavior.
+Its workflow covers private game-code capture, indexing, offline assessment and
+publication of workspace-owned tools and research. Deployment, game-file edits,
+game launches and changes to SphereOpt's behavior need separate instructions.
 
 ## Boundaries
 
@@ -19,6 +19,9 @@ SphereOpt's behavior.
 - Game inputs are read-only. Builds use a verified captured assembly set.
 - Keep generated output and source indexes local. JDocMunch embeddings stay
   disabled. Prefer configured Munch retrieval after checking index freshness.
+- `tools/prepare_code_index.py` creates a verified source copy under `.local/`
+  with independent Git identity for indexing. It must have no remote. Never
+  publish or stage that private source tree.
 
 ## Commands
 
@@ -28,6 +31,8 @@ committing changes to their behavior. Test unchanged-input capture reuse.
 
 ## Scope and history
 
-This local repository has no remote. SphereOpt's clone retains its original
-remote; creating a hosted fork or publishing this workspace is a separate
-operation. Read [licensing notes](docs/LICENSING.md) before distributing code.
+The workspace and SphereOpt have separate histories. SphereOpt's clone retains
+its original remote; publishing the workspace does not publish or fork that
+clone. Read [licensing notes](docs/LICENSING.md) before distributing code.
+
+Research memories use the topic `dspmods_sphereopt_assessment`.

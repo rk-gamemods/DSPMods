@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -15,20 +16,31 @@ SPEC.loader.exec_module(capture)
 class CaptureTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.cleanup_temp)
         self.root = Path(self.temp.name)
         self.game = self.root / "game"
         self.managed = self.game / "DSPGAME_Data/Managed"
         self.managed.mkdir(parents=True)
         (self.managed / "Assembly-CSharp.dll").write_bytes(b"fixture v1")
+        (self.managed / "UnityEngine.CoreModule.dll").write_bytes(b"fixture unity")
         self.state = self.root / "state"
         self.calls = 0
+
+    def cleanup_temp(self):
+        if self.root.is_dir():
+            assert self.root.resolve().parent == Path(tempfile.gettempdir()).resolve()
+            assert not self.root.is_symlink() and not self.root.is_junction()
+            shutil.rmtree(capture.filesystem_path(self.root))
+        self.temp.cleanup()
 
     def decompile(self, managed, output):
         self.calls += 1
         output.mkdir()
-        (output / "Game.cs").write_text("class Game {}", encoding="utf-8")
-        (output / "Game.csproj").write_text("<Project />", encoding="utf-8")
+        for assembly in managed.glob("*.dll"):
+            project = output / assembly.stem
+            project.mkdir()
+            (project / "Game.cs").write_text("class Game {}", encoding="utf-8")
+            (project / "Game.csproj").write_text("<Project />", encoding="utf-8")
 
     def run_capture(self, runner=None):
         return capture.capture(self.game, self.state, version="fixture compiler", runner=runner or self.decompile)
@@ -71,7 +83,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_corrupt_cached_source_is_not_reused(self):
         first = self.run_capture()
-        (Path(first["snapshot"]) / "source/Game.cs").write_text("corrupt", encoding="utf-8")
+        (Path(first["snapshot"]) / "source/Assembly-CSharp/Game.cs").write_text("corrupt", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "verification"):
             self.run_capture()
 
@@ -143,6 +155,37 @@ class CaptureTests(unittest.TestCase):
         capture.latest(self.state, managed=Path(result["snapshot"]) / "Managed")
         with self.assertRaisesRegex(RuntimeError, "Compiler input"):
             capture.latest(self.state, managed=self.managed)
+
+    def test_missing_unity_decompilation_is_rejected_before_publication(self):
+        def incomplete(managed, output):
+            output.mkdir()
+            project = output / "Assembly-CSharp"
+            project.mkdir()
+            (project / "Game.csproj").write_text("<Project />", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "Missing decompiled project for UnityEngine"):
+            self.run_capture(incomplete)
+        self.assertFalse((self.state / "latest.json").exists())
+
+    def test_primary_only_schema_one_snapshot_remains_verifiable(self):
+        first = self.run_capture()
+        snapshot = Path(first["snapshot"])
+        manifest = json.loads((snapshot / "manifest.json").read_text())
+        manifest["schema"] = manifest["identity"]["schema"] = 1
+        manifest["identity"].pop("decompile_scope")
+        manifest["id"] = capture.hashlib.sha256(json.dumps(manifest["identity"], sort_keys=True).encode()).hexdigest()
+        capture.write_json(snapshot / "manifest.json", manifest)
+        self.assertEqual(capture.verify_snapshot(snapshot)["schema"], 1)
+
+    @unittest.skipUnless(os.name == "nt", "Windows long-path regression")
+    def test_published_source_over_legacy_path_limit_is_verified_and_reused(self):
+        def long_source(managed, output):
+            self.decompile(managed, output)
+            folder = capture.filesystem_path(output / "Assembly-CSharp" / ("Nested" * 30))
+            folder.mkdir()
+            (folder / "Long.cs").write_text("class Long {}", encoding="utf-8")
+        first = self.run_capture(long_source)
+        self.assertEqual(self.run_capture(long_source)["status"], "reused")
+        self.assertIn("Long.cs", " ".join(capture.verify_snapshot(Path(first["snapshot"]))["files"]))
 
 
 if __name__ == "__main__":

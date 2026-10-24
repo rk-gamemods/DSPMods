@@ -22,6 +22,20 @@ static class Program
         try
         {
             if (args.Length == 1 && args[0] == "self-test") return SelfTest();
+            if (args.Length == 4 && args[0] == "instructions")
+            {
+                using var assembly = AssemblyDefinition.ReadAssembly(args[1]);
+                var type = Types(assembly.MainModule.Types).Single(t => t.FullName == args[2]);
+                var method = type.Methods.Single(m => m.Name == args[3]);
+                Console.WriteLine(JsonSerializer.Serialize(new {
+                    method = method.FullName,
+                    locals = method.Body.Variables.Select(v => new { index = v.Index, type = v.VariableType.FullName }),
+                    instructions = method.Body.Instructions.Select(i => new {
+                        offset = i.Offset, opcode = i.OpCode.Name, operand = i.Operand?.ToString()
+                    })
+                }, JsonOptions));
+                return 0;
+            }
             if (args.Length == 3 && args[0] == "describe")
             {
                 using var assembly = AssemblyDefinition.ReadAssembly(args[1]);
@@ -34,7 +48,7 @@ static class Program
                 return 0;
             }
             if (args.Length == 0 || args[0] != "check")
-                throw new ArgumentException("Usage: check --managed DIR --mod FILE --report FILE | self-test");
+                throw new ArgumentException("Usage: check --managed DIR --mod FILE --report FILE | describe FILE TYPE | instructions FILE TYPE METHOD | self-test");
             string Option(string name)
             {
                 var i = Array.IndexOf(args, name);

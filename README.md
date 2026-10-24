@@ -1,7 +1,12 @@
 # Dyson Sphere Program modding workspace
 
-Local source review, game-code capture and offline compatibility checks. No
-command here installs a mod or starts the game.
+Tools and research for local source review, game-code capture and offline
+compatibility checks. Game binaries, reconstructed source and indexes stay
+private. No command here installs a mod or starts the game.
+
+The [SphereOpt assessment](docs/SPHEREOPT_ASSESSMENT.md) finds that its rendering
+approach remains relevant to DSP 0.10.35.29151. The released 0.9.2 DLL passes
+metadata checks; runtime, shader and performance compatibility remain untested.
 
 ## Prepare
 
@@ -13,11 +18,12 @@ py -3 tools/game_snapshot.py capture
 
 The clone command is only needed when the independent clone is absent. The
 capture discovers Steam libraries, snapshots the installed managed DLLs and
-decompiles `Assembly-CSharp.dll` using the pinned ILSpy tool. Override discovery
+decompiles every managed DLL using the pinned ILSpy tool. Override discovery
 with `--game 'D:\SteamLibrary\steamapps\common\Dyson Sphere Program'`.
 
 Captures are local under `.local/snapshots/`. A manifest identifies every input
-assembly by SHA-256, the Steam build and the decompiler version. Unchanged,
+assembly by SHA-256, the Steam build, decompilation scope and decompiler version.
+Unchanged,
 verified captures are reused. Failed capture leaves the previous latest pointer
 untouched. If a process crashes, an OS-owned file lock is released automatically;
 an incomplete staging directory is retained only if cleanup itself fails.
@@ -28,8 +34,6 @@ an incomplete staging directory is retained only if cleanup itself fails.
 py -3 tools/game_snapshot.py verify
 dotnet build tools/OfflineChecks -c Release
 dotnet run --project tools/OfflineChecks -c Release --no-build -- self-test
-dotnet build tools/SphereOpt.OfflineBuild -c Release
-py -3 tools/game_snapshot.py check-mod .local/build/SphereOpt/SphereOpt.dll
 py -3 -m unittest discover -s tests -v
 ```
 
@@ -38,10 +42,18 @@ against captured installed-game assemblies. It does not edit the upstream
 project or deploy its output. Its output is analysis material, not a packaged
 release with a validated shader bundle.
 
-The initial build attempt reported seven member-access or availability errors.
-Whether these require publicized reference assemblies or source changes remains
-unresolved; they do not establish runtime incompatibility. Run `check-mod` only
-after a successful build produces a current plugin DLL.
+Building unchanged SphereOpt against unmodified installed DLLs reports seven
+access errors involving six private fields. All six fields still exist. This
+differs from the upstream publicized reference setup and does not establish
+runtime incompatibility. To inspect the published plugin, run `check-mod` against
+its separately downloaded DLL. That released 0.9.2 DLL passed 351 reference and
+15 Harmony target checks for the assessed game build.
+
+To reproduce the source-build access errors:
+
+```powershell
+dotnet build tools/SphereOpt.OfflineBuild -c Release
+```
 
 If capture uses an explicit game path, pass the same selection to the build:
 
@@ -58,9 +70,34 @@ apply Harmony patches, validate shader rendering or benchmark FPS. Transpiler
 instruction matching requires additional review. See
 [workflow and contracts](docs/WORKFLOW.md).
 
+## Index all managed source privately
+
+```powershell
+py -3 tools/prepare_code_index.py
+py -3 tools/source_coverage.py
+```
+
+Use the returned `source_root` with JCodeMunch `index_folder`,
+`identity_mode="git"` and `use_ai_summaries=false`. The helper verifies every
+copied file against the snapshot and creates an independent local Git identity
+with no remote. This avoids merging private source into the public workspace's
+index identity. Repeated preparation verifies and reuses the same tree.
+
+Schema 2 stores source per assembly under `source/<assembly-name>/`; older
+schema 1 snapshots remain verifiable but contain only the primary game source.
+The assessed capture includes all 95 installed managed DLLs, including game
+logic, Unity modules and bundled framework libraries. All 14,675 generated C#
+files were indexed. The coverage command also checks PE headers of DLLs and EXEs
+outside `Managed`; none of those in the assessed installation is managed.
+
+This covers managed implementation and Unity's native-call declarations. It
+does not recover Unity's native C++ engine or GPU shader implementations. See
+the [coverage and compatibility assessment](docs/SPHEREOPT_ASSESSMENT.md).
+
 ## Sources and decisions
 
 - [Clone/fork and licensing evaluation](docs/LICENSING.md)
 - [Task scope and workflow](docs/WORKFLOW.md)
 - [Pinned upstream source](sources.json)
+- [SphereOpt relevance and compatibility assessment](docs/SPHEREOPT_ASSESSMENT.md)
 - [SphereOpt upstream](https://github.com/andyoneal/SphereOpt)

@@ -16,7 +16,9 @@ and makes publication a more immediate concern.
 
 The current phase uses a full local clone under `external/SphereOpt/`, ignored by
 the workspace repository. A fork can be added later without abandoning local
-work. No GitHub fork or new remote publication was performed.
+work. The public `rk-gamemods/DSPMods` workspace contains analysis tools and
+research; the independent SphereOpt clone remains excluded. No hosted SphereOpt
+fork or game-material publication is part of that workspace publication.
 
 ## The Unlicense is not an absent license
 

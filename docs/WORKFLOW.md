@@ -1,6 +1,6 @@
 # Task scope and workflow contract
 
-## Requested outcomes
+## Bootstrap history
 
 1. Register a local T3 project and keep its work outside the scratch directory.
 2. Retain SphereOpt source/history and evaluate clone/fork and license options.
@@ -15,6 +15,11 @@ Installed game files are read-only inputs. Global Munch packages/configuration
 belong to the user environment, not this repository. Existing unrelated
 repositories, active MCP processes and their working changes are preserved.
 
+The subsequent publication and assessment task authorizes a public
+`rk-gamemods/DSPMods` workspace, complete managed-source indexing and a SphereOpt
+compatibility investigation. Private inputs and the independent upstream clone
+remain excluded from publication.
+
 T3 registered this workspace at `DSPMods`. The exposed T3 thread metadata tool
 does not support moving an existing thread between projects. Use the app's
 conversation menu to attach this conversation; creating a project alone does
@@ -26,6 +31,12 @@ Inputs are the installed managed DLL set, sanitized Steam build metadata,
 capture schema and pinned ILSpy version. Their hashes determine snapshot
 identity. Every captured input is re-hashed after copying; installed inputs are
 checked again before publication to detect an update during capture.
+
+Schema 2 includes `decompile_scope=all-managed` in the identity and decompiles
+each DLL into a separate project. Verification requires a project for every
+captured DLL. Schema 1 remains readable as historical primary-assembly evidence.
+Long Windows paths are verified through extended paths, including after staging
+is renamed into its final snapshot directory.
 
 Output is staged under `.local/staging/`, verified, and renamed to its immutable
 snapshot directory. `latest.json` is replaced atomically only after success.

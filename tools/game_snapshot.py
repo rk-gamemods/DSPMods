@@ -16,12 +16,21 @@ import uuid
 from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA = 1
+SCHEMA = 2
 ILSPY = ["dotnet", "tool", "run", "ilspycmd", "--"]
 
 
+def filesystem_path(path: Path) -> Path:
+    """Keep Windows' legacy path limit out of recursive source verification."""
+    path = path.resolve()
+    if os.name == "nt" and not str(path).startswith("\\\\?\\"):
+        value = str(path)
+        return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+    return path
+
+
 def sha256(path: Path) -> str:
-    with path.open("rb") as stream:
+    with filesystem_path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
@@ -124,23 +133,33 @@ def steam_build(game: Path) -> str:
 
 
 def decompile(managed: Path, output: Path) -> None:
+    output = filesystem_path(output)
     output.mkdir()
-    print("Decompiling Assembly-CSharp.dll; details go to decompile.log.", flush=True)
+    assemblies = sorted(managed.glob("*.dll"))
     with (output.parent / "decompile.log").open("w", encoding="utf-8") as log:
-        subprocess.run(ILSPY + ["--disable-updatecheck", "-p", "--nested-directories", "-r", str(managed),
-                               "-o", str(output), str(managed / "Assembly-CSharp.dll")],
-                       cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
-    if not any(output.rglob("*.cs")) or not any(output.glob("*.csproj")):
-        raise RuntimeError("Decompiler produced no C# project.")
+        for number, assembly in enumerate(assemblies, 1):
+            destination = output / assembly.stem
+            print(f"Decompiling {number}/{len(assemblies)}: {assembly.name}", flush=True)
+            log.write(f"\n=== {assembly.name} ===\n")
+            log.flush()
+            subprocess.run(ILSPY + ["--disable-updatecheck", "-p", "--nested-directories", "-r", str(managed),
+                                   "-o", str(destination), str(assembly)],
+                           cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
+            if not any(destination.glob("*.csproj")):
+                raise RuntimeError(f"Decompiler produced no project for {assembly.name}.")
 
 
 def verify_snapshot(snapshot: Path, expected_id: str | None = None) -> dict:
-    snapshot = snapshot.resolve()
+    snapshot = filesystem_path(snapshot)
     manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
     encoded = json.dumps(manifest["identity"], sort_keys=True).encode()
     identity = hashlib.sha256(encoded).hexdigest()
-    if manifest.get("schema") != SCHEMA or identity != manifest.get("id") or (expected_id and identity != expected_id):
+    if (manifest.get("schema") not in {1, SCHEMA}
+            or manifest["identity"].get("schema") != manifest["schema"]
+            or identity != manifest.get("id") or (expected_id and identity != expected_id)):
         raise RuntimeError("Snapshot identity or schema mismatch.")
+    if manifest["schema"] == 2 and manifest["identity"].get("decompile_scope") != "all-managed":
+        raise RuntimeError("Schema 2 requires all-managed decompilation scope.")
     expected_files = manifest["files"]
     if not expected_files:
         raise RuntimeError("Snapshot file manifest is empty.")
@@ -155,6 +174,10 @@ def verify_snapshot(snapshot: Path, expected_id: str | None = None) -> dict:
     for item in manifest["identity"]["assemblies"]:
         if expected_files.get("Managed/" + item["name"]) != item["sha256"]:
             raise RuntimeError("Captured assembly does not match input identity.")
+        if manifest["schema"] == 2:
+            prefix = "source/" + Path(item["name"]).stem + "/"
+            if not any(name.startswith(prefix) and name.endswith(".csproj") for name in expected_files):
+                raise RuntimeError(f"Missing decompiled project for {item['name']}.")
     return manifest
 
 
@@ -184,7 +207,8 @@ def capture(game: Path, state: Path, *, version: str, runner=decompile) -> dict:
     with capture_lock(state):
         managed = game / "DSPGAME_Data/Managed"
         original = inventory(managed)
-        identity = {"schema": SCHEMA, "assemblies": original, "steam_build": steam_build(game), "ilspy": version}
+        identity = {"schema": SCHEMA, "assemblies": original, "steam_build": steam_build(game), "ilspy": version,
+                    "decompile_scope": "all-managed"}
         snapshot_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         snapshot = output_path(state, "snapshots/" + snapshot_id)
         if snapshot.exists():
@@ -208,7 +232,8 @@ def capture(game: Path, state: Path, *, version: str, runner=decompile) -> dict:
             runner(copied, stage / "source")
             if inventory(managed) != original:
                 raise RuntimeError("Installed assemblies changed during decompilation; retry after the update.")
-            files = {p.relative_to(stage).as_posix(): sha256(p) for p in stage.rglob("*")
+            walk_stage = filesystem_path(stage)
+            files = {p.relative_to(walk_stage).as_posix(): sha256(p) for p in walk_stage.rglob("*")
                      if p.is_file() and p.name != "decompile.log"}
             manifest = {"schema": SCHEMA, "id": snapshot_id, "identity": identity,
                         "created_utc": datetime.now(timezone.utc).isoformat(), "files": files}
@@ -216,13 +241,14 @@ def capture(game: Path, state: Path, *, version: str, runner=decompile) -> dict:
             verify_snapshot(stage, snapshot_id)
             snapshot.parent.mkdir(exist_ok=True)
             stage.rename(snapshot)
+            verify_snapshot(snapshot, snapshot_id)
             publish_latest(state, snapshot, manifest)
             return {"status": "created", "snapshot": str(snapshot), "id": snapshot_id}
         finally:
             if stage.exists():
                 if stage.is_symlink() or stage.resolve().parent != staging_root.resolve():
                     raise RuntimeError("Refusing unexpected staging cleanup path.")
-                shutil.rmtree(stage)
+                shutil.rmtree(filesystem_path(stage))
 
 
 def latest(state: Path, *, managed: Path | None = None) -> tuple[Path, dict]:
