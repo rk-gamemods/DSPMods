@@ -22,6 +22,10 @@ game launches and changes to SphereOpt's behavior need separate instructions.
 - `tools/prepare_code_index.py` creates a verified source copy under `.local/`
   with independent Git identity for indexing. It must have no remote. Never
   publish or stage that private source tree.
+- Follow the [SphereOpt indexing workflow](README.md#index-sphereopt-source-and-project-text)
+  for the mod clone. Default JCodeMunch discovery omits its shader extensions.
+  Completion requires a file inventory and hash-verified text readback covering
+  every implementation and text file, recorded in the local coverage manifest.
 
 ## Commands
 

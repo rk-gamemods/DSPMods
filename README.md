@@ -94,6 +94,41 @@ This covers managed implementation and Unity's native-call declarations. It
 does not recover Unity's native C++ engine or GPU shader implementations. See
 the [coverage and compatibility assessment](docs/SPHEREOPT_ASSESSMENT.md).
 
+## Index SphereOpt source and project text
+
+```powershell
+py -3 tools/prepare_sphereopt_index.py --index-code
+```
+
+This audits every clone file and prepares a local text projection. Code indexing
+uses the configured JCodeMunch Python runtime and public indexing API with a
+local copy of its configuration. Global settings and the independent clone stay
+unchanged. ShaderLab/HLSL extensions use an approximate C++ grammar: all shader
+text is stored, while shader symbol extraction can be incomplete.
+
+Index the returned `text_index_root` with JDocMunch `index_local`, using the
+returned `text_index_name`, `use_embeddings=false` and `use_ai_summaries=false`.
+This covers every text file, including shader source, Unity settings and scenes,
+build configuration, documentation and tracked editor settings. Binary artifacts
+have a separate path/size/hash catalog.
+
+Completion requires comparing JCodeMunch's file tree and JDocMunch's document
+inventory against `.local/sphereopt-index-coverage.json`. Read back each projected
+document's section with hash verification enabled and compression/boilerplate
+removal disabled. Record the observed inventories and content-hash results, then
+pass that JSON to `--verify-index-inventory`. The verifier rejects missing code,
+missing or unexpected text documents, and failed or mismatched content hashes.
+The expected observation fields are exercised in
+[the coverage tests](tests/test_sphereopt_index.py).
+
+```powershell
+py -3 tools/prepare_sphereopt_index.py --verify-index-inventory .local/sphereopt-observed-indexes.json
+```
+
+An ordinary default refresh of the clone will omit shader extensions again;
+use this workflow for SphereOpt refreshes. See the
+[assessed coverage](docs/SPHEREOPT_ASSESSMENT.md#sphereopt-source-index).
+
 ## Sources and decisions
 
 - [Clone/fork and licensing evaluation](docs/LICENSING.md)

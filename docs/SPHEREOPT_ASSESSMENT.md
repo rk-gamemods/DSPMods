@@ -53,6 +53,32 @@ additional reverse engineering is unnecessary for this initial assessment;
 native behavior and shader compatibility remain runtime questions.
 Decompiled C# is a reconstruction. Captured assembly bytes are authoritative.
 
+## SphereOpt source index
+
+The clone at the assessed commit contains 90 files: 85 text files and 5 binary
+artifacts, including Unity's export helper and project files.
+
+The expanded `andyoneal/SphereOpt` code index contains 75 files and 927 extracted
+symbols. Its file inventory now includes all **48 implementation files**:
+33 C#, 10 `.shader`, 2 `.compute` and 3 `.cginc` files. Both the top-level shader
+directory and the Unity asset project's shader directory are covered.
+ShaderLab/HLSL use the available C++ grammar for approximate symbol extraction;
+the full source text is retained even when no symbol is extracted.
+
+The companion `local/SphereOpt-fulltext-a06ca9a7bd53` JDocMunch index covers all
+**85 text files**, plus one binary-artifact catalog. Every one of those 86
+document bodies was retrieved through Munch with both content and source hash
+verification. Each returned hash matched the generated projection manifest.
+The text index therefore includes the Unity settings, scene, build configuration,
+documentation and other text outside the code index. It uses no embeddings.
+
+The 5 binary artifacts are 3 asset bundles, an icon and a vendored Rider editor
+plugin DLL. Their paths, sizes and hashes are cataloged; they are not represented
+as recovered source. All projections and index evidence remain local. The
+[repeatable workflow](../README.md#index-sphereopt-source-and-project-text)
+rejects unaccounted clone files and refuses a completion claim if an
+implementation file or verified text body is missing.
+
 ## Why SphereOpt still has work to do
 
 In the current game's `DysonSphereSegmentRenderer.DrawModels`, shells are still
