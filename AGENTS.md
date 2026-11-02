@@ -9,13 +9,18 @@ outside this workflow unless explicitly requested.
 ## Boundaries
 
 - `external/SphereOpt/` is an independent, ignored Git clone. Inspect its own
-  status before changes. Preserve its upstream source and notices.
+  status before changes. Preserve its licence and attribution notices.
 - The current update retains vanilla node/frame drawing. Do not activate legacy
   replacement shaders or culling merely because their C# source compiles.
 - Keep the canonical Unity-project shell source, delivered bundle, runtime hash
   pin and `SHADER_PROVENANCE.json` synchronized. Run the shader identity check.
+- `PerformanceMonitor.GpuProfilerOn` selects vanilla rendering. A SphereOpt
+  benchmark must confirm batching is active.
 - `.local/` holds private game assembly snapshots, decompiled source, reports
-  and machine-specific metadata. Never commit or publish these inputs.
+  and machine-specific metadata. Never commit or publish these inputs. Tracked
+  files carry no machine-specific paths.
+- Decompiled source is a reading aid. Captured assemblies are the authority for
+  compatibility checks.
 - `sources.json` records the upstream revision used for this assessment.
 - `tools/game_snapshot.py` owns capture identity, staging, verification and the
   latest-snapshot pointer. Do not hand-edit its generated manifests.

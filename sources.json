@@ -16,7 +16,6 @@
   },
   "optimization_stack_review": {
     "date": "2026-10-24",
-    "report": "docs/OPTIMIZATION_STACK.md",
     "Weaver": {
       "url": "https://github.com/TheAIBot/DSP_Weaver",
       "installed_package_version": "2.5.0",

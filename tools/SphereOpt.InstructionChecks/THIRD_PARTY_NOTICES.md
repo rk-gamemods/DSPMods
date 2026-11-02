@@ -10,7 +10,7 @@ method bodies retain the source operations. The third replaces the source's
 expression with a static fixture-call instruction of the same stack arity.
 Its callback and dirty-field behavior are not executed or reproduced.
 
-The source file SHA-256 values at that revision are reported in the README.
+The source file SHA-256 values at that revision are pinned in `StackChecks.cs`.
 Optional installed-DLL checks compare the first two complete normalized method
 bodies and the third method's matcher/removal/mask-load prefix and return
 suffix. Its delegate factory and callback body are excluded. These comparisons
