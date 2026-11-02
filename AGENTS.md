@@ -6,6 +6,9 @@ publication of workspace-owned tools and research, and the requested current-gam
 SphereOpt source update. Deployment, game-file edits and game launches remain
 outside this workflow unless explicitly requested.
 
+Follow [CLAUDE.md](CLAUDE.md) too. It holds the rules for every DSP mod worked on
+from this folder.
+
 ## Boundaries
 
 - `external/SphereOpt/` is an independent, ignored Git clone. Inspect its own
