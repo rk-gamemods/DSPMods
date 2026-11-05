@@ -4,7 +4,7 @@ These rules cover every Dyson Sphere Program mod worked on from this folder. Fir
 
 ## Documentation
 - Docs go stale, so keep as few as is safe. A doc must hold something the code can't show and have a strong reason to exist.
-- Allowed: one short README per repo, CLAUDE.md, AGENTS.md, licence and notice files, and each private fork's UPSTREAM.md and CHANGES-PRIVATE.md. Nothing else.
+- Allowed: one short README per repo, CLAUDE.md, AGENTS.md, licence and notice files, each private fork's UPSTREAM.md and CHANGES-PRIVATE.md, and DSP-Unified's design/ARCH.md. Nothing else.
 - Before creating any .md or .txt file, check that list. If it isn't allowed, say it in chat or a commit message.
 - The final report is your closing chat message. Results go there or in commit messages. Write a report file only when asked, outside the repo or in .local/reports/.
 - Code explains itself: clear names, small functions. No comments, except a minimal one on code that must be dense to get a performance gain. Delete other comments in code you change.
@@ -41,6 +41,8 @@ These rules cover every Dyson Sphere Program mod worked on from this folder. Fir
 - Timing runs: low graphics, shadows off, vsync off, small window, a TEST-DO-NOT-USE- copy of save3 starting at planet 502.
 - Measure CPU time (tick time plus main-thread frame time minus GPU wait), not FPS or UPS alone.
 - One agent owns the test rig at a time.
+- A package goes to a game window only with a passing offline preflight receipt for its exact bytes: every module's hooks installed with real HarmonyX, and an all-Off cold start under byte-loaded Mono.
+- Only the rig owner may suspend other processes, and only while the game is running.
 
 ## Git
 - Work on feature branches. Commit and push often, but only to rk-gamemods repos, never to main or an upstream remote. Merging is the owner's call.
